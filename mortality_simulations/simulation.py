@@ -10,6 +10,37 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 
 
+def get_optimal_params(n_rows: int) -> tuple[int, int]:
+    """
+    Get optimal (n_processes, batch_size) based on benchmark calibration.
+
+    Calibrated on a 10-core MacBook with the following results:
+    - 10K rows: 1 process, batch_size=50 (overhead dominated)
+    - 100K rows: 1 process, batch_size=50 (overhead dominated)
+    - 1M rows: 2 processes, batch_size=25 (parallelism helps)
+    - 20M rows: 2 processes, batch_size=10 (memory constrained)
+
+    Parameters
+    ----------
+    n_rows : int
+        Number of rows in the dataset.
+
+    Returns
+    -------
+    tuple[int, int]
+        Optimal (n_processes, batch_size) for the given data size.
+    """
+    if n_rows < 500_000:
+        # Small data: multiprocessing overhead exceeds benefit
+        return (1, 50)
+    elif n_rows < 5_000_000:
+        # Medium data: parallelism helps, memory is manageable
+        return (2, 25)
+    else:
+        # Large data: memory constrained, use small batches
+        return (2, 10)
+
+
 def _worker_vectorized_batch(args):
     """Worker function - each process runs vectorized batches."""
     volumes, baseline_qx, shocked_qx, large_mask, n_trials, batch_size = args
@@ -73,8 +104,8 @@ def stochastic_runs_hybrid(
     volume_col,
     baseline_qx_col,
     shocked_qx_col,
-    n_processes=None,
-    batch_size=50,
+    n_processes="auto",
+    batch_size="auto",
 ):
     """
     Hybrid parallel Monte Carlo simulation with vectorized batches.
@@ -94,11 +125,11 @@ def stochastic_runs_hybrid(
         Column name for baseline mortality rates (qx).
     shocked_qx_col : str
         Column name for shocked mortality rates (qx).
-    n_processes : int, optional
-        Number of parallel processes. Defaults to cpu_count().
-    batch_size : int, default=50
-        Number of trials per batch within each worker.
-        Smaller batch size reduces memory usage (50 for 20M rows ≈ 8GB per batch).
+    n_processes : int or "auto", default="auto"
+        Number of parallel processes. "auto" selects optimal based on data size.
+    batch_size : int or "auto", default="auto"
+        Number of trials per batch within each worker. "auto" selects optimal
+        based on data size to balance speed and memory usage.
 
     Returns
     -------
@@ -113,8 +144,15 @@ def stochastic_runs_hybrid(
         - volume_baseline_10PLUS: Large claim volumes baseline
         - volume_shocked_10PLUS: Large claim volumes shocked
     """
-    if n_processes is None:
-        n_processes = cpu_count()
+    n_rows = len(data)
+
+    # Apply calibrated defaults if "auto"
+    if n_processes == "auto" or batch_size == "auto":
+        optimal_processes, optimal_batch = get_optimal_params(n_rows)
+        if n_processes == "auto":
+            n_processes = optimal_processes
+        if batch_size == "auto":
+            batch_size = optimal_batch
 
     # Extract data once
     volumes = data[volume_col].values
