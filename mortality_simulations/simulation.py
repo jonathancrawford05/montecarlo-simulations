@@ -5,9 +5,70 @@ This module implements a stochastic mortality simulation that uses multiprocessi
 with vectorized batch operations for efficient large-scale simulations.
 """
 
+import os
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
+
+
+def _init_worker():
+    """
+    Initialize worker process with single-threaded NumPy.
+
+    Prevents thread oversubscription when using multiprocessing with
+    multi-threaded BLAS/MKL libraries. Each worker process will use
+    single-threaded NumPy, while parallelism comes from multiprocessing.
+    """
+    # Set thread limits for common BLAS implementations
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
+def check_threading_config() -> dict:
+    """
+    Check current NumPy/BLAS threading configuration.
+
+    Returns information about thread pools used by NumPy's underlying
+    BLAS/LAPACK libraries. Useful for diagnosing performance issues.
+
+    Returns
+    -------
+    dict
+        Threading configuration with keys:
+        - 'threadpool_info': List of thread pool configs (if threadpoolctl installed)
+        - 'env_vars': Current thread-related environment variables
+        - 'warning': Any warnings about potential issues
+    """
+    result = {
+        "env_vars": {
+            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "not set"),
+            "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "not set"),
+            "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "not set"),
+        },
+        "warning": None,
+    }
+
+    try:
+        import threadpoolctl
+
+        info = threadpoolctl.threadpool_info()
+        result["threadpool_info"] = info
+
+        # Check for potential oversubscription
+        total_threads = sum(lib.get("num_threads", 1) for lib in info)
+        if total_threads > cpu_count():
+            result["warning"] = (
+                f"Potential thread oversubscription: {total_threads} threads "
+                f"across BLAS libraries, but only {cpu_count()} CPU cores. "
+                "Consider setting OMP_NUM_THREADS=1 before importing numpy."
+            )
+    except ImportError:
+        result["threadpool_info"] = "threadpoolctl not installed (pip install threadpoolctl)"
+
+    return result
 
 
 def get_optimal_params(n_rows: int) -> tuple[int, int]:
@@ -173,8 +234,9 @@ def stochastic_runs_hybrid(
             (volumes, baseline_qx, shocked_qx, large_mask, worker_trials, batch_size)
         )
 
-    # Run parallel
-    with Pool(n_processes) as pool:
+    # Run parallel with thread-safe workers
+    # initializer prevents BLAS/MKL thread oversubscription
+    with Pool(n_processes, initializer=_init_worker) as pool:
         worker_results = pool.map(_worker_vectorized_batch, worker_args)
 
     # Concatenate results from all workers

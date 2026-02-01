@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mortality_simulations import get_optimal_params, stochastic_runs_hybrid
+from mortality_simulations import check_threading_config, get_optimal_params, stochastic_runs_hybrid
 
 
 @pytest.fixture
@@ -162,3 +162,23 @@ class TestGetOptimalParams:
         # At boundary
         n_processes, batch_size = get_optimal_params(5_000_000)
         assert batch_size == 10
+
+
+class TestCheckThreadingConfig:
+    """Tests for the check_threading_config function."""
+
+    def test_returns_expected_keys(self):
+        """Test that config contains expected keys."""
+        config = check_threading_config()
+
+        assert "env_vars" in config
+        assert "warning" in config
+        assert "threadpool_info" in config
+
+    def test_env_vars_structure(self):
+        """Test that env_vars has expected structure."""
+        config = check_threading_config()
+
+        assert "OMP_NUM_THREADS" in config["env_vars"]
+        assert "MKL_NUM_THREADS" in config["env_vars"]
+        assert "OPENBLAS_NUM_THREADS" in config["env_vars"]

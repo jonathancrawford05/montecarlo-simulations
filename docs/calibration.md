@@ -203,6 +203,113 @@ else:
     return (4, 10)
 ```
 
+## NumPy Threading and BLAS
+
+### The Problem: Thread Oversubscription
+
+NumPy uses optimized BLAS libraries (OpenBLAS, MKL, Accelerate) that may spawn their own threads. When combined with multiprocessing, this can cause **thread oversubscription**:
+
+```
+2 processes × 10 BLAS threads = 20 threads competing for 10 cores
+```
+
+This leads to:
+- Context switching overhead
+- Cache thrashing
+- Worse performance than single-threaded
+
+### Built-in Protection
+
+The simulation automatically handles this by setting thread limits in worker processes:
+
+```python
+# Automatically set in each worker process:
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+```
+
+This ensures parallelism comes from multiprocessing, not BLAS threading.
+
+### Checking Your Configuration
+
+Use the built-in diagnostic function:
+
+```python
+from mortality_simulations import check_threading_config
+
+config = check_threading_config()
+print(config)
+
+# Example output:
+# {
+#     'threadpool_info': [
+#         {'num_threads': 10, 'prefix': 'libopenblas', ...},
+#     ],
+#     'env_vars': {
+#         'OMP_NUM_THREADS': 'not set',
+#         'MKL_NUM_THREADS': 'not set',
+#         ...
+#     },
+#     'warning': 'Potential thread oversubscription: 10 threads ...'
+# }
+```
+
+For detailed thread pool inspection, install `threadpoolctl`:
+
+```bash
+poetry add threadpoolctl
+```
+
+### When to Override Thread Control
+
+In rare cases, you might want BLAS threading instead of multiprocessing:
+
+```python
+import os
+# Set BEFORE importing numpy
+os.environ["OMP_NUM_THREADS"] = "4"
+
+from mortality_simulations import stochastic_runs_hybrid
+
+# Use single process, let BLAS parallelize
+results = stochastic_runs_hybrid(
+    data=df,
+    n_trials=1000,
+    n_processes=1,  # Single process
+    batch_size=100,  # Larger batches OK with single process
+    ...
+)
+```
+
+This approach may work better when:
+- Your BLAS is highly optimized for your hardware (e.g., Intel MKL on Intel CPUs)
+- Memory bandwidth is not the bottleneck
+- Process spawning overhead is significant
+
+### Benchmarking Different Threading Strategies
+
+To compare strategies, test with explicit configurations:
+
+```python
+import os
+import time
+
+# Strategy 1: Multiprocessing with single-threaded BLAS (default)
+start = time.perf_counter()
+results1 = stochastic_runs_hybrid(data, n_trials=100, n_processes=2, batch_size=25)
+print(f"Multiprocessing: {time.perf_counter() - start:.2f}s")
+
+# Strategy 2: Single process with multi-threaded BLAS
+# Note: Must set env vars BEFORE numpy import (restart Python)
+os.environ["OMP_NUM_THREADS"] = "4"
+# ... restart Python and re-import ...
+start = time.perf_counter()
+results2 = stochastic_runs_hybrid(data, n_trials=100, n_processes=1, batch_size=100)
+print(f"BLAS threading: {time.perf_counter() - start:.2f}s")
+```
+
 ## Advanced Tuning
 
 ### Manual Override
