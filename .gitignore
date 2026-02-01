@@ -63,7 +63,7 @@ ipython_config.py
 .python-version
 
 # Poetry
-poetry.lock
+# poetry.lock
 
 # Environments
 .env

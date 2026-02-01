@@ -74,7 +74,7 @@ def run_calibration_suite():
     print("=" * 60)
 
     # Test configurations
-    row_sizes = [10_000, 100_000, 1_000_000]
+    row_sizes = [10_000, 100_000, 1_000_000, 20_000_000, ]  # 100_000_000 
     n_trials = 100
     process_counts = [1, 2, 4, cpu_count()]
     batch_sizes = [10, 25, 50, 100]
