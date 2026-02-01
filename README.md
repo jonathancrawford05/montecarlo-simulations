@@ -9,6 +9,7 @@ This project implements stochastic mortality simulations designed to efficiently
 - **Multiprocessing**: Distributes trials across CPU cores
 - **Vectorized batching**: NumPy-based batch operations within each worker
 - **Auto-tuning**: Automatically selects optimal parameters based on data size
+- **Joint life modeling**: Supports last-to-die policies with mortality correlation and contagion
 
 ## Project Structure
 
@@ -16,11 +17,13 @@ This project implements stochastic mortality simulations designed to efficiently
 mortality_simulations/
 ├── mortality_simulations/     # Main package
 │   ├── __init__.py
-│   └── simulation.py          # Core simulation functions
+│   ├── simulation.py          # Single life simulation
+│   └── joint_life.py          # Joint life simulation with contagion
 ├── tests/                     # Unit tests
 ├── benchmarks/                # Performance benchmarks and calibration
 ├── docs/                      # Documentation
-│   └── calibration.md         # Calibration guide and benchmark results
+│   ├── calibration.md         # Performance calibration guide
+│   └── joint_life.md          # Joint life modeling guide
 ├── data/                      # Sample data (gitignored)
 ├── pyproject.toml             # Poetry configuration
 └── README.md
@@ -123,6 +126,49 @@ The package includes calibrated defaults based on benchmarks run on a 10-core Ma
 - **More cores ≠ faster**: Beyond 2 processes, coordination overhead and memory bandwidth become bottlenecks
 
 For detailed benchmark results and guidance on calibrating for your system, see [docs/calibration.md](docs/calibration.md).
+
+## Joint Life Simulation
+
+For policies covering two lives with "last-to-die" payout (claim triggers when both lives have died):
+
+```python
+from mortality_simulations import stochastic_runs_joint_life
+
+# Data must have paired lives (A and B) per policy
+results = stochastic_runs_joint_life(
+    data=joint_life_data,
+    n_trials=1000,
+    policy_col='policy_number',
+    life_id_col='life_id',          # 'A' or 'B'
+    volume_col='volume',
+    baseline_qx_col='baseline_qx',
+    shocked_qx_col='shocked_qx',
+    rho=0.15,                       # Mortality correlation (Gaussian copula)
+    contagion_multiplier=1.5,       # Survivor's qx increases when partner dies
+)
+```
+
+### Mixed Portfolio (Single + Joint Lives)
+
+```python
+from mortality_simulations import stochastic_runs_portfolio
+
+results = stochastic_runs_portfolio(
+    data=mixed_data,
+    n_trials=1000,
+    volume_col='volume',
+    baseline_qx_col='baseline_qx',
+    shocked_qx_col='shocked_qx',
+    life_status_col='life_status',  # 'single' or 'joint'
+    policy_col='policy_number',
+    life_id_col='life_id',
+    rho=0.15,
+    contagion_multiplier=1.5,
+)
+# Returns combined results plus separate single_life_* and joint_life_* breakdowns
+```
+
+For detailed documentation on joint life modeling, correlation estimation, and contagion effects, see [docs/joint_life.md](docs/joint_life.md).
 
 ## Development
 
