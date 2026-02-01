@@ -93,6 +93,37 @@ class TestStochasticRunsHybrid:
 
         assert len(results["claim_count_baseline"]) == 10
 
+    def test_single_process_bypasses_pool(self, sample_data):
+        """Test that single process mode is faster (bypasses Pool overhead)."""
+        import time
+
+        # Warm up
+        _ = stochastic_runs_hybrid(
+            data=sample_data,
+            n_trials=5,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_processes=1,
+        )
+
+        # Time single process (should bypass Pool)
+        start = time.perf_counter()
+        for _ in range(3):
+            _ = stochastic_runs_hybrid(
+                data=sample_data,
+                n_trials=10,
+                volume_col="volume",
+                baseline_qx_col="baseline_qx",
+                shocked_qx_col="shocked_qx",
+                n_processes=1,
+            )
+        single_time = time.perf_counter() - start
+
+        # Single process should complete quickly (no Pool spawn overhead)
+        # With 1000 rows and 10 trials, this should be < 0.5s total for 3 runs
+        assert single_time < 1.0, f"Single process took {single_time:.2f}s, expected < 1s"
+
     def test_results_are_lists(self, sample_data):
         """Test that results are returned as Python lists."""
         results = stochastic_runs_hybrid(

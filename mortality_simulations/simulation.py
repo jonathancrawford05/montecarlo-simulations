@@ -234,10 +234,16 @@ def stochastic_runs_hybrid(
             (volumes, baseline_qx, shocked_qx, large_mask, worker_trials, batch_size)
         )
 
-    # Run parallel with thread-safe workers
-    # initializer prevents BLAS/MKL thread oversubscription
-    with Pool(n_processes, initializer=_init_worker) as pool:
-        worker_results = pool.map(_worker_vectorized_batch, worker_args)
+    # Execute simulation
+    if n_processes == 1:
+        # Single process: bypass Pool entirely to avoid overhead
+        # (process spawning, pickling, IPC)
+        worker_results = [_worker_vectorized_batch(worker_args[0])]
+    else:
+        # Multi-process: use Pool with thread-safe workers
+        # initializer prevents BLAS/MKL thread oversubscription
+        with Pool(n_processes, initializer=_init_worker) as pool:
+            worker_results = pool.map(_worker_vectorized_batch, worker_args)
 
     # Concatenate results from all workers
     final_results = {}
