@@ -8,7 +8,7 @@ This project implements stochastic mortality simulations designed to efficiently
 
 - **Multiprocessing**: Distributes trials across CPU cores
 - **Vectorized batching**: NumPy-based batch operations within each worker
-- **Memory-efficient design**: Configurable batch sizes to manage memory usage
+- **Auto-tuning**: Automatically selects optimal parameters based on data size
 
 ## Project Structure
 
@@ -19,6 +19,8 @@ mortality_simulations/
 │   └── simulation.py          # Core simulation functions
 ├── tests/                     # Unit tests
 ├── benchmarks/                # Performance benchmarks and calibration
+├── docs/                      # Documentation
+│   └── calibration.md         # Calibration guide and benchmark results
 ├── data/                      # Sample data (gitignored)
 ├── pyproject.toml             # Poetry configuration
 └── README.md
@@ -47,6 +49,10 @@ poetry shell
 
 ## Usage
 
+### Basic Usage (Recommended)
+
+The simulation automatically selects optimal parameters based on your data size:
+
 ```python
 import pandas as pd
 from mortality_simulations import stochastic_runs_hybrid
@@ -58,15 +64,13 @@ data = pd.DataFrame({
     'shocked_qx': [...],       # Shocked mortality rates
 })
 
-# Run simulations
+# Run simulations - auto-tuning selects optimal parameters
 results = stochastic_runs_hybrid(
     data=data,
     n_trials=1000,
     volume_col='volume',
     baseline_qx_col='baseline_qx',
     shocked_qx_col='shocked_qx',
-    n_processes=None,          # Uses all available cores
-    batch_size=50,             # Adjust based on memory constraints
 )
 
 # Results contain:
@@ -76,21 +80,49 @@ results = stochastic_runs_hybrid(
 # - volume_baseline_10PLUS / volume_shocked_10PLUS
 ```
 
-## Configuration
+### Manual Parameter Override
 
-### Parameters
+For fine-grained control, you can specify parameters explicitly:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `n_processes` | `cpu_count()` | Number of parallel workers |
-| `batch_size` | 50 | Trials per batch (lower = less memory) |
+```python
+results = stochastic_runs_hybrid(
+    data=data,
+    n_trials=1000,
+    volume_col='volume',
+    baseline_qx_col='baseline_qx',
+    shocked_qx_col='shocked_qx',
+    n_processes=2,      # Override auto-selection
+    batch_size=25,      # Override auto-selection
+)
+```
 
-### Memory Guidelines
+### Inspecting Optimal Parameters
 
-For large datasets, adjust `batch_size` based on available RAM:
+```python
+from mortality_simulations import get_optimal_params
 
-- **20M rows, batch_size=50**: ~8GB per worker
-- **20M rows, batch_size=25**: ~4GB per worker
+# Get recommended parameters for your data size
+n_processes, batch_size = get_optimal_params(n_rows=1_000_000)
+print(f"Recommended: {n_processes} processes, batch_size={batch_size}")
+```
+
+## Auto-Tuning
+
+The package includes calibrated defaults based on benchmarks run on a 10-core MacBook:
+
+| Data Size | n_processes | batch_size | Rationale |
+|-----------|-------------|------------|-----------|
+| < 500K rows | 1 | 50 | Multiprocessing overhead exceeds benefit |
+| 500K - 5M rows | 2 | 25 | Parallelism helps, memory manageable |
+| > 5M rows | 2 | 10 | Memory-constrained, small batches critical |
+
+### Key Insights
+
+- **Small data**: Single process is faster because multiprocessing overhead (process spawning, data serialization) exceeds computation time
+- **Large data**: Memory pressure dominates; smaller batch sizes prevent swap thrashing
+- **More cores ≠ faster**: Beyond 2 processes, coordination overhead and memory bandwidth become bottlenecks
+
+For detailed benchmark results and guidance on calibrating for your system, see [docs/calibration.md](docs/calibration.md).
 
 ## Development
 
@@ -103,7 +135,8 @@ poetry run pytest
 ### Running Benchmarks
 
 ```bash
-poetry run pytest benchmarks/ --benchmark-only
+# Full calibration suite
+poetry run python benchmarks/benchmark_simulation.py
 ```
 
 ## License
