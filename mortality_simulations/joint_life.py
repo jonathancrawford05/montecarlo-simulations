@@ -20,6 +20,104 @@ from scipy.stats import norm
 from mortality_simulations.simulation import _init_worker, get_optimal_params
 
 
+# Pre-defined parameter configurations
+PARAM_CONFIGS = {
+    "correlation_only": {
+        "rho": 0.25,
+        "contagion_multiplier": 1.0,
+        "description": (
+            "Uses correlation (rho) only to model joint death dependency. "
+            "Simpler single-parameter approach. Recommended for single-period models."
+        ),
+    },
+    "contagion_only": {
+        "rho": 0.0,
+        "contagion_multiplier": 1.5,
+        "description": (
+            "Uses contagion multiplier only (independent base mortality). "
+            "Models pure widow/widower effect without shared environment correlation."
+        ),
+    },
+    "low_correlation_with_contagion": {
+        "rho": 0.05,
+        "contagion_multiplier": 1.35,
+        "description": (
+            "Low correlation for shared environment, plus time-weighted contagion. "
+            "Separates the two effects while avoiding double-counting. "
+            "Contagion of 1.35 reflects annual average of decaying widow effect."
+        ),
+    },
+    "moderate_combined": {
+        "rho": 0.10,
+        "contagion_multiplier": 1.25,
+        "description": (
+            "Moderate values of both parameters. "
+            "Use when you have evidence for both shared environment and causal contagion."
+        ),
+    },
+    "multi_period_literature": {
+        "rho": 0.05,
+        "contagion_multiplier": 1.5,
+        "description": (
+            "Based on actuarial literature for multi-period projections. "
+            "Low rho for shared environment, standard contagion for widow effect. "
+            "In multi-period models, contagion applies to future periods after first death."
+        ),
+    },
+}
+
+
+def get_joint_life_params(config: str = "correlation_only") -> dict:
+    """
+    Get pre-defined parameter configuration for joint life simulation.
+
+    Provides recommended (rho, contagion_multiplier) combinations based on
+    different modeling approaches. Helps avoid double-counting effects.
+
+    Parameters
+    ----------
+    config : str, default="correlation_only"
+        Configuration name. Options:
+        - "correlation_only": Single parameter (rho=0.25, contagion=1.0)
+        - "contagion_only": Pure widow effect (rho=0.0, contagion=1.5)
+        - "low_correlation_with_contagion": Separated effects (rho=0.05, contagion=1.35)
+        - "moderate_combined": Both effects moderate (rho=0.10, contagion=1.25)
+        - "multi_period_literature": For multi-year projections (rho=0.05, contagion=1.5)
+
+    Returns
+    -------
+    dict
+        Configuration with keys: 'rho', 'contagion_multiplier', 'description'
+
+    Examples
+    --------
+    >>> params = get_joint_life_params("correlation_only")
+    >>> results = stochastic_runs_joint_life(
+    ...     data=data,
+    ...     rho=params["rho"],
+    ...     contagion_multiplier=params["contagion_multiplier"],
+    ...     ...
+    ... )
+    """
+    if config not in PARAM_CONFIGS:
+        available = ", ".join(PARAM_CONFIGS.keys())
+        raise ValueError(f"Unknown config '{config}'. Available: {available}")
+
+    return PARAM_CONFIGS[config].copy()
+
+
+def list_param_configs() -> dict:
+    """
+    List all available parameter configurations with descriptions.
+
+    Returns
+    -------
+    dict
+        Dictionary of all configurations and their descriptions.
+    """
+    return {name: cfg["description"] for name, cfg in PARAM_CONFIGS.items()}
+
+
 def generate_correlated_uniforms(n_pairs: int, n_trials: int, rho: float) -> tuple[np.ndarray, np.ndarray]:
     """
     Generate correlated uniform random variables using Gaussian copula.

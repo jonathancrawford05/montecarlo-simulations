@@ -7,6 +7,9 @@ import pytest
 from mortality_simulations import (
     apply_contagion,
     generate_correlated_uniforms,
+    get_joint_life_params,
+    list_param_configs,
+    PARAM_CONFIGS,
     prepare_joint_life_data,
     stochastic_runs_joint_life,
     stochastic_runs_portfolio,
@@ -461,3 +464,71 @@ class TestStochasticRunsPortfolio:
                 policy_col=None,  # Missing
                 life_id_col="life_id",
             )
+
+
+class TestParamConfigs:
+    """Tests for parameter configuration helper functions."""
+
+    def test_get_joint_life_params_returns_expected_keys(self):
+        """Test that get_joint_life_params returns expected keys."""
+        params = get_joint_life_params("correlation_only")
+
+        assert "rho" in params
+        assert "contagion_multiplier" in params
+        assert "description" in params
+
+    def test_get_joint_life_params_all_configs(self):
+        """Test that all configurations are valid."""
+        for config_name in PARAM_CONFIGS.keys():
+            params = get_joint_life_params(config_name)
+
+            assert 0 <= params["rho"] <= 1
+            assert params["contagion_multiplier"] >= 1.0
+            assert len(params["description"]) > 0
+
+    def test_get_joint_life_params_invalid_raises(self):
+        """Test that invalid config name raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown config"):
+            get_joint_life_params("invalid_config")
+
+    def test_list_param_configs_returns_all(self):
+        """Test that list_param_configs returns all configurations."""
+        configs = list_param_configs()
+
+        assert len(configs) == len(PARAM_CONFIGS)
+        for name in PARAM_CONFIGS.keys():
+            assert name in configs
+
+    def test_correlation_only_has_no_contagion(self):
+        """Test that correlation_only config disables contagion."""
+        params = get_joint_life_params("correlation_only")
+
+        assert params["contagion_multiplier"] == 1.0
+        assert params["rho"] > 0
+
+    def test_contagion_only_has_no_correlation(self):
+        """Test that contagion_only config disables correlation."""
+        params = get_joint_life_params("contagion_only")
+
+        assert params["rho"] == 0.0
+        assert params["contagion_multiplier"] > 1.0
+
+    def test_params_can_be_used_in_simulation(self, joint_life_data):
+        """Test that params work correctly with simulation."""
+        params = get_joint_life_params("correlation_only")
+
+        results = stochastic_runs_joint_life(
+            data=joint_life_data,
+            n_trials=10,
+            policy_col="policy_number",
+            life_id_col="life_id",
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            rho=params["rho"],
+            contagion_multiplier=params["contagion_multiplier"],
+            n_processes=1,
+        )
+
+        assert len(results["claim_count_baseline"]) == 10
+

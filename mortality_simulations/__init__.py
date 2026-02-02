@@ -11,6 +11,9 @@ from mortality_simulations.joint_life import (
     generate_correlated_uniforms,
     prepare_joint_life_data,
     apply_contagion,
+    get_joint_life_params,
+    list_param_configs,
+    PARAM_CONFIGS,
 )
 
 __version__ = "0.1.0"
@@ -25,4 +28,8 @@ __all__ = [
     "generate_correlated_uniforms",
     "prepare_joint_life_data",
     "apply_contagion",
+    # Parameter configurations
+    "get_joint_life_params",
+    "list_param_configs",
+    "PARAM_CONFIGS",
 ]

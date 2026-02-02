@@ -65,6 +65,102 @@ Literature suggests:
 - Medium term (6-24 months): multiplier ≈ 1.2-1.5
 - Long term (2+ years): multiplier ≈ 1.0-1.1
 
+## Understanding ρ (Correlation) vs Contagion
+
+### What Each Parameter Represents
+
+| Parameter | Phenomenon | Mechanism |
+|-----------|------------|-----------|
+| **ρ (rho)** | Shared risk factors | Correlated random draws cause coincident deaths |
+| **contagion_multiplier** | Widow/widower effect | One death *causes* increased mortality in survivor |
+
+### Single-Period vs Multi-Period Models
+
+The distinction matters most in **multi-period** simulations:
+
+```
+Multi-period timeline:
+Year 1: Both alive → ρ affects joint survival probability
+Year 2: Life A dies → contagion increases B's qx for remaining years
+Year 3+: B's elevated mortality persists (with possible decay)
+```
+
+In a **single-period** (annual) model, both mechanisms increase P(both die within year), creating partial overlap:
+
+```
+Single-period equivalence:
+  ρ=0.30, contagion=1.0  →  ~22.6 avg claims
+  ρ=0.15, contagion=1.5  →  ~23.8 avg claims
+  ρ=0.00, contagion=2.0  →  ~34.0 avg claims
+```
+
+### Caution: Avoiding Double-Counting
+
+Using high values of **both** parameters in a single-period model may overstate joint death probability. Consider:
+
+1. **Correlation only** (recommended for single-period):
+   - Set `rho=0.25`, `contagion_multiplier=1.0`
+   - ρ captures the combined effect from all sources
+   - Single parameter to calibrate
+
+2. **Separated effects** (if evidence supports both):
+   - Set `rho=0.05` for shared environment only
+   - Set `contagion_multiplier=1.35` for time-weighted annual widow effect
+   - Requires more careful calibration
+
+3. **Multi-period projections**:
+   - Use both parameters with literature values
+   - Contagion applies to future periods after first death
+   - More realistic for long-term projections
+
+### Time-Weighted Contagion for Single Period
+
+If using contagion in a single-period model, consider the time-weighted average:
+
+```
+Literature values:
+  0-6 months post-death:  HR ≈ 1.75 (midpoint of 1.5-2.0)
+  6-12 months post-death: HR ≈ 1.35 (midpoint of 1.2-1.5)
+
+For deaths uniformly distributed through year:
+  Expected exposure ≈ 0.5 years on average
+  Time-weighted multiplier ≈ 1.30-1.40
+```
+
+### Pre-Defined Configurations
+
+Use `get_joint_life_params()` to select recommended configurations:
+
+```python
+from mortality_simulations import get_joint_life_params, list_param_configs
+
+# See available configurations
+print(list_param_configs())
+
+# Get specific configuration
+params = get_joint_life_params("correlation_only")
+print(f"rho={params['rho']}, contagion={params['contagion_multiplier']}")
+print(params['description'])
+
+# Use in simulation
+results = stochastic_runs_joint_life(
+    data=data,
+    rho=params["rho"],
+    contagion_multiplier=params["contagion_multiplier"],
+    ...
+)
+```
+
+Available configurations:
+
+| Config | ρ | Contagion | Use Case |
+|--------|---|-----------|----------|
+| `correlation_only` | 0.25 | 1.0 | Single-period, simple calibration |
+| `contagion_only` | 0.0 | 1.5 | Pure widow effect, no shared environment |
+| `low_correlation_with_contagion` | 0.05 | 1.35 | Separated effects, single-period |
+| `moderate_combined` | 0.10 | 1.25 | Evidence for both effects |
+| `multi_period_literature` | 0.05 | 1.5 | Multi-year projections |
+
 ## Usage
 
 ### Basic Joint Life Simulation
