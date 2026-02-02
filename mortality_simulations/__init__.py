@@ -41,4 +41,8 @@ __all__ = [
     "estimate_required_simulations",
     "generate_confidence_summary",
     "print_confidence_summary",
+    # Parameter configurations
+    "get_joint_life_params",
+    "list_param_configs",
+    "PARAM_CONFIGS",
 ]
