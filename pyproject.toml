@@ -12,6 +12,7 @@ numpy = "^1.26.0"
 pandas = "^2.1.0"
 scipy = "^1.11.0"
 threadpoolctl = {version = "^3.2.0", optional = true}
+scipy = ">=1.10,<2.0"
 
 [tool.poetry.extras]
 diagnostics = ["threadpoolctl"]

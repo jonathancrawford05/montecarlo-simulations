@@ -1,8 +1,12 @@
 """Mortality Monte Carlo Simulations package."""
 
 from mortality_simulations.simulation import (
+    analyze_simulation_confidence,
     check_threading_config,
+    estimate_required_simulations,
+    generate_confidence_summary,
     get_optimal_params,
+    print_confidence_summary,
     stochastic_runs_hybrid,
 )
 from mortality_simulations.joint_life import (
@@ -32,4 +36,9 @@ __all__ = [
     "get_joint_life_params",
     "list_param_configs",
     "PARAM_CONFIGS",
+    # confidence analysis
+    "analyze_simulation_confidence",
+    "estimate_required_simulations",
+    "generate_confidence_summary",
+    "print_confidence_summary",
 ]

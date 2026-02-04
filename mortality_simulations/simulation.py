@@ -3,12 +3,16 @@ Monte Carlo mortality simulation with hybrid parallel processing.
 
 This module implements a stochastic mortality simulation that uses multiprocessing
 with vectorized batch operations for efficient large-scale simulations.
+
+Includes confidence analysis tools for quantifying uncertainty in simulation
+results, particularly for tail quantiles used in risk management.
 """
 
 import os
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
+from scipy import stats
 
 
 def _init_worker():
@@ -251,3 +255,374 @@ def stochastic_runs_hybrid(
         final_results[key] = np.concatenate([w[key] for w in worker_results])
 
     return {k: v.tolist() for k, v in final_results.items()}
+
+
+def analyze_simulation_confidence(
+    results: dict,
+    metric: str,
+    quantile: float = 0.95,
+    confidence_level: float = 0.95,
+) -> dict:
+    """
+    Compute confidence interval for a quantile from simulation results.
+
+    Uses the exact binomial method based on order statistics to determine
+    which simulation outcomes bound the true quantile with the specified
+    confidence level.
+
+    Parameters
+    ----------
+    results : dict
+        Output from stochastic_runs_hybrid containing simulation results.
+    metric : str
+        Key in results dict to analyze (e.g., "claim_volume_shocked").
+    quantile : float, default=0.95
+        Target quantile to estimate (0 to 1).
+    confidence_level : float, default=0.95
+        Confidence level for the interval (0 to 1).
+
+    Returns
+    -------
+    dict
+        Analysis results containing:
+        - 'n_simulations': Number of simulations used
+        - 'quantile': Target quantile
+        - 'point_estimate': Sample quantile value
+        - 'ci_lower': Lower bound of confidence interval
+        - 'ci_upper': Upper bound of confidence interval
+        - 'ci_width': Width of confidence interval
+        - 'ci_width_relative': Width as percentage of point estimate
+        - 'confidence_level': Confidence level used
+        - 'order_stat_lower': Lower order statistic index used
+        - 'order_stat_upper': Upper order statistic index used
+
+    Examples
+    --------
+    >>> results = stochastic_runs_hybrid(data, n_trials=10000, ...)
+    >>> ci = analyze_simulation_confidence(results, "claim_volume_shocked")
+    >>> print(f"95th percentile: {ci['point_estimate']:,.0f}")
+    >>> print(f"95% CI: [{ci['ci_lower']:,.0f}, {ci['ci_upper']:,.0f}]")
+    """
+    if metric not in results:
+        available = list(results.keys())
+        raise ValueError(f"Metric '{metric}' not found. Available: {available}")
+
+    data = np.array(results[metric])
+    n = len(data)
+
+    if n < 10:
+        raise ValueError(f"Need at least 10 simulations, got {n}")
+
+    # Sort data for order statistics
+    sorted_data = np.sort(data)
+
+    # Point estimate of quantile
+    point_estimate = np.quantile(data, quantile)
+
+    # Find order statistics for CI using binomial method
+    # For quantile p, the j-th order statistic X_(j) satisfies:
+    # P(X_(j) <= xi_p) = P(Binomial(n, p) >= j)
+    alpha = 1 - confidence_level
+
+    # Lower bound: find largest j such that P(Bin(n,p) < j) <= alpha/2
+    # Upper bound: find smallest k such that P(Bin(n,p) >= k) <= alpha/2
+    j_lower = stats.binom.ppf(alpha / 2, n, quantile)
+    k_upper = stats.binom.ppf(1 - alpha / 2, n, quantile)
+
+    # Convert to 0-based indices and bound to valid range
+    idx_lower = max(0, int(j_lower) - 1)
+    idx_upper = min(n - 1, int(k_upper))
+
+    ci_lower = sorted_data[idx_lower]
+    ci_upper = sorted_data[idx_upper]
+    ci_width = ci_upper - ci_lower
+
+    # Relative width (as percentage)
+    if point_estimate != 0:
+        ci_width_relative = (ci_width / point_estimate) * 100
+    else:
+        ci_width_relative = float("inf") if ci_width > 0 else 0.0
+
+    return {
+        "n_simulations": n,
+        "quantile": quantile,
+        "point_estimate": float(point_estimate),
+        "ci_lower": float(ci_lower),
+        "ci_upper": float(ci_upper),
+        "ci_width": float(ci_width),
+        "ci_width_relative": float(ci_width_relative),
+        "confidence_level": confidence_level,
+        "order_stat_lower": idx_lower + 1,  # 1-based for reporting
+        "order_stat_upper": idx_upper + 1,
+    }
+
+
+def estimate_required_simulations(
+    pilot_results: dict,
+    metric: str,
+    quantile: float = 0.95,
+    target_ci_width_relative: float = 1.0,
+    confidence_level: float = 0.95,
+) -> dict:
+    """
+    Estimate number of simulations required for a target confidence interval width.
+
+    Uses pilot run results to estimate the density at the quantile, then
+    applies the asymptotic formula for quantile standard error to determine
+    the required sample size.
+
+    Parameters
+    ----------
+    pilot_results : dict
+        Output from stochastic_runs_hybrid (pilot run with smaller n_trials).
+    metric : str
+        Key in results dict to analyze.
+    quantile : float, default=0.95
+        Target quantile (0 to 1).
+    target_ci_width_relative : float, default=1.0
+        Target CI width as percentage of point estimate (e.g., 1.0 = ±0.5%).
+    confidence_level : float, default=0.95
+        Confidence level for the interval.
+
+    Returns
+    -------
+    dict
+        Estimation results containing:
+        - 'pilot_n': Number of simulations in pilot
+        - 'pilot_ci_width_relative': Current CI width (%)
+        - 'target_ci_width_relative': Target CI width (%)
+        - 'estimated_n_required': Estimated simulations needed
+        - 'scaling_factor': Ratio of required to pilot simulations
+        - 'quantile': Target quantile
+        - 'confidence_level': Confidence level
+
+    Notes
+    -----
+    The asymptotic standard error of a sample quantile is:
+        SE(ξ̂_p) ≈ sqrt(p(1-p)/n) / f(ξ_p)
+
+    Since CI width ∝ 1/sqrt(n), to reduce width by factor k requires
+    k² times more simulations.
+
+    Examples
+    --------
+    >>> pilot = stochastic_runs_hybrid(data, n_trials=1000, ...)
+    >>> est = estimate_required_simulations(
+    ...     pilot, "claim_volume_shocked", target_ci_width_relative=1.0
+    ... )
+    >>> print(f"Need {est['estimated_n_required']:,} simulations for 1% CI width")
+    """
+    # Get current CI from pilot
+    current_ci = analyze_simulation_confidence(
+        pilot_results, metric, quantile, confidence_level
+    )
+
+    pilot_n = current_ci["n_simulations"]
+    current_width_rel = current_ci["ci_width_relative"]
+
+    if current_width_rel == 0:
+        return {
+            "pilot_n": pilot_n,
+            "pilot_ci_width_relative": current_width_rel,
+            "target_ci_width_relative": target_ci_width_relative,
+            "estimated_n_required": pilot_n,
+            "scaling_factor": 1.0,
+            "quantile": quantile,
+            "confidence_level": confidence_level,
+            "note": "CI width is zero; pilot may be sufficient or data has no variability",
+        }
+
+    # CI width scales as 1/sqrt(n), so n scales as (width_ratio)^2
+    width_ratio = current_width_rel / target_ci_width_relative
+    scaling_factor = width_ratio ** 2
+    estimated_n = int(np.ceil(pilot_n * scaling_factor))
+
+    return {
+        "pilot_n": pilot_n,
+        "pilot_ci_width_relative": float(current_width_rel),
+        "target_ci_width_relative": target_ci_width_relative,
+        "estimated_n_required": estimated_n,
+        "scaling_factor": float(scaling_factor),
+        "quantile": quantile,
+        "confidence_level": confidence_level,
+    }
+
+
+def generate_confidence_summary(
+    results: dict,
+    metric: str,
+    quantile: float = 0.95,
+    confidence_level: float = 0.95,
+    simulation_scenarios: list[int] | None = None,
+) -> dict:
+    """
+    Generate a comprehensive confidence analysis summary.
+
+    Analyzes the current simulation results and projects confidence intervals
+    for different simulation counts (10K, 100K, 1M by default).
+
+    Parameters
+    ----------
+    results : dict
+        Output from stochastic_runs_hybrid containing simulation results.
+    metric : str
+        Key in results dict to analyze (e.g., "claim_volume_shocked").
+    quantile : float, default=0.95
+        Target quantile to analyze.
+    confidence_level : float, default=0.95
+        Confidence level for intervals.
+    simulation_scenarios : list[int], optional
+        Simulation counts to project. Default: [10_000, 100_000, 1_000_000].
+
+    Returns
+    -------
+    dict
+        Summary containing:
+        - 'current_analysis': Full analysis of current results
+        - 'scenarios': List of projected CI widths for each scenario
+        - 'recommendation': Suggested simulation count based on use case
+        - 'metric': Metric analyzed
+        - 'quantile': Quantile analyzed
+
+    Examples
+    --------
+    >>> results = stochastic_runs_hybrid(data, n_trials=10000, ...)
+    >>> summary = generate_confidence_summary(results, "claim_volume_shocked")
+    >>> for scenario in summary['scenarios']:
+    ...     print(f"{scenario['n_simulations']:>10,}: CI width ≈ {scenario['projected_ci_width_relative']:.2f}%")
+    """
+    if simulation_scenarios is None:
+        simulation_scenarios = [10_000, 100_000, 1_000_000]
+
+    # Current analysis
+    current = analyze_simulation_confidence(
+        results, metric, quantile, confidence_level
+    )
+
+    current_n = current["n_simulations"]
+    current_width_rel = current["ci_width_relative"]
+
+    # Project CI widths for each scenario
+    # CI width scales as 1/sqrt(n)
+    scenarios = []
+    for n_sim in simulation_scenarios:
+        scaling = np.sqrt(current_n / n_sim)
+        projected_width = current_width_rel * scaling
+
+        # Also project absolute CI width
+        projected_abs_width = current["ci_width"] * scaling
+
+        scenarios.append({
+            "n_simulations": n_sim,
+            "projected_ci_width_relative": float(projected_width),
+            "projected_ci_width_absolute": float(projected_abs_width),
+            "is_current": n_sim == current_n,
+        })
+
+    # Generate recommendation based on common use cases
+    recommendation = _generate_recommendation(scenarios, quantile)
+
+    return {
+        "metric": metric,
+        "quantile": quantile,
+        "confidence_level": confidence_level,
+        "current_analysis": current,
+        "scenarios": scenarios,
+        "recommendation": recommendation,
+    }
+
+
+def _generate_recommendation(scenarios: list[dict], quantile: float) -> dict:
+    """Generate recommendation based on projected CI widths."""
+    recommendations = {
+        "exploratory": {
+            "threshold": 5.0,
+            "description": "Exploratory analysis, rough estimates",
+        },
+        "reporting": {
+            "threshold": 2.0,
+            "description": "Management reporting, internal risk metrics",
+        },
+        "regulatory": {
+            "threshold": 1.0,
+            "description": "Regulatory capital, external reporting",
+        },
+        "precision": {
+            "threshold": 0.5,
+            "description": "High-precision requirements, model validation",
+        },
+    }
+
+    result = {}
+    for use_case, config in recommendations.items():
+        threshold = config["threshold"]
+        # Find smallest n that achieves threshold
+        suitable = [s for s in scenarios if s["projected_ci_width_relative"] <= threshold]
+        if suitable:
+            best = min(suitable, key=lambda x: x["n_simulations"])
+            result[use_case] = {
+                "recommended_n": best["n_simulations"],
+                "achieves_ci_width": best["projected_ci_width_relative"],
+                "threshold": threshold,
+                "description": config["description"],
+            }
+        else:
+            # Extrapolate required n
+            # Find the scenario with smallest width and extrapolate
+            best_available = min(scenarios, key=lambda x: x["projected_ci_width_relative"])
+            ratio = best_available["projected_ci_width_relative"] / threshold
+            extrapolated_n = int(best_available["n_simulations"] * (ratio ** 2))
+            result[use_case] = {
+                "recommended_n": extrapolated_n,
+                "achieves_ci_width": threshold,
+                "threshold": threshold,
+                "description": config["description"],
+                "extrapolated": True,
+            }
+
+    return result
+
+
+def print_confidence_summary(summary: dict) -> None:
+    """
+    Print a formatted confidence analysis summary.
+
+    Parameters
+    ----------
+    summary : dict
+        Output from generate_confidence_summary().
+    """
+    current = summary["current_analysis"]
+    print("=" * 70)
+    print(f"SIMULATION CONFIDENCE ANALYSIS")
+    print(f"Metric: {summary['metric']}")
+    print(f"Quantile: {summary['quantile'] * 100:.0f}th percentile")
+    print(f"Confidence Level: {summary['confidence_level'] * 100:.0f}%")
+    print("=" * 70)
+
+    print(f"\nCURRENT RESULTS ({current['n_simulations']:,} simulations)")
+    print("-" * 50)
+    print(f"  Point estimate:     {current['point_estimate']:>20,.2f}")
+    print(f"  CI lower bound:     {current['ci_lower']:>20,.2f}")
+    print(f"  CI upper bound:     {current['ci_upper']:>20,.2f}")
+    print(f"  CI width:           {current['ci_width']:>20,.2f}")
+    print(f"  CI width (relative):{current['ci_width_relative']:>19.2f}%")
+
+    print(f"\nPROJECTED CI WIDTH BY SIMULATION COUNT")
+    print("-" * 50)
+    print(f"  {'Simulations':>15}  {'CI Width (%)':>15}  {'Status':<15}")
+    for scenario in summary["scenarios"]:
+        status = "← current" if scenario["is_current"] else ""
+        print(
+            f"  {scenario['n_simulations']:>15,}  "
+            f"{scenario['projected_ci_width_relative']:>14.2f}%  "
+            f"{status:<15}"
+        )
+
+    print(f"\nRECOMMENDATIONS BY USE CASE")
+    print("-" * 50)
+    for use_case, rec in summary["recommendation"].items():
+        extra = " (extrapolated)" if rec.get("extrapolated") else ""
+        print(f"  {rec['description']}:")
+        print(f"    → {rec['recommended_n']:,} simulations (CI ≤ {rec['threshold']}%){extra}")
+    print("=" * 70)
