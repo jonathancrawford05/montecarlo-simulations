@@ -2447,4 +2447,4 @@ diagnostics = ["threadpoolctl"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "d0d6b8e493582eebb49a0cf8043ee1c6674f55677d82a85baad32028d25bf313"
+content-hash = "c3b09448cfc3ef50e346de49960ce829a763c9e05d5a46442b1a6fd5c8864c09"
