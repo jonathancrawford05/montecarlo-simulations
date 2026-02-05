@@ -357,6 +357,198 @@ def analyze_simulation_confidence(
     }
 
 
+def compute_portfolio_moments(
+    volumes: np.ndarray,
+    qx: np.ndarray,
+) -> dict:
+    """
+    Compute exact analytical moments of the aggregate claim distribution.
+
+    For a portfolio of independent lives where life i has death probability
+    qx_i and claim volume v_i, the total claim volume S = sum(v_i * D_i)
+    where D_i ~ Bernoulli(qx_i). This function computes the exact moments
+    of S using the individual life parameters.
+
+    Parameters
+    ----------
+    volumes : np.ndarray
+        Claim volume for each life (1-D array of length n_lives).
+    qx : np.ndarray
+        Mortality rate for each life (1-D array of length n_lives).
+
+    Returns
+    -------
+    dict
+        Exact distribution moments:
+        - 'mean': E[S] = sum(v_i * qx_i)
+        - 'variance': Var(S) = sum(v_i^2 * qx_i * (1 - qx_i))
+        - 'std': Standard deviation sqrt(Var(S))
+        - 'skewness': Standardised third central moment
+        - 'third_central_moment': sum(v_i^3 * qx_i * (1-qx_i) * (1-2*qx_i))
+        - 'n_lives': Number of lives in the portfolio
+        - 'cv': Coefficient of variation (std / mean)
+
+    Notes
+    -----
+    These moments are exact for a sum of independent heterogeneous
+    Bernoulli random variables (Poisson binomial), weighted by volumes.
+    No simulation is required.
+    """
+    volumes = np.asarray(volumes, dtype=float)
+    qx = np.asarray(qx, dtype=float)
+
+    if len(volumes) != len(qx):
+        raise ValueError(
+            f"volumes and qx must have same length, got {len(volumes)} and {len(qx)}"
+        )
+
+    pq = qx * (1 - qx)  # Bernoulli variance factor per life
+
+    mean = np.sum(volumes * qx)
+    variance = np.sum(volumes**2 * pq)
+    std = np.sqrt(variance)
+    third_central_moment = np.sum(volumes**3 * pq * (1 - 2 * qx))
+    skewness = third_central_moment / std**3 if std > 0 else 0.0
+
+    return {
+        "mean": float(mean),
+        "variance": float(variance),
+        "std": float(std),
+        "skewness": float(skewness),
+        "third_central_moment": float(third_central_moment),
+        "n_lives": len(volumes),
+        "cv": float(std / mean) if mean > 0 else float("inf"),
+    }
+
+
+def estimate_quantile_ci_width(
+    moments: dict,
+    n_simulations: int,
+    quantile: float = 0.95,
+    confidence_level: float = 0.95,
+) -> dict:
+    """
+    Estimate confidence interval width for a quantile analytically.
+
+    Uses the exact portfolio moments and the asymptotic distribution of
+    sample quantiles to compute the expected CI width for a given number
+    of simulations. Applies the Cornish-Fisher expansion to account for
+    skewness in the aggregate claim distribution.
+
+    Parameters
+    ----------
+    moments : dict
+        Output from compute_portfolio_moments().
+    n_simulations : int
+        Number of Monte Carlo simulations.
+    quantile : float, default=0.95
+        Target quantile (0 to 1).
+    confidence_level : float, default=0.95
+        Confidence level for the interval (0 to 1).
+
+    Returns
+    -------
+    dict
+        Analytical CI estimates:
+        - 'quantile_estimate_normal': Quantile under normal approximation
+        - 'quantile_estimate_cf': Quantile under Cornish-Fisher expansion
+        - 'ci_width_absolute': Expected CI width (absolute)
+        - 'ci_width_relative': Expected CI width as % of quantile estimate
+        - 'se_quantile': Standard error of the sample quantile
+        - 'n_simulations': Simulations used
+        - 'quantile': Target quantile
+        - 'confidence_level': Confidence level
+        - 'method': 'cornish_fisher' or 'normal'
+
+    Notes
+    -----
+    The standard error of the p-th sample quantile from n iid draws is:
+
+        SE(ξ̂_p) = sqrt(p(1-p) / n) / f(ξ_p)
+
+    Under a normal approximation, f(ξ_p) = phi(z_p) / sigma, giving:
+
+        SE = sqrt(p(1-p) / n) * sigma / phi(z_p)
+
+    The Cornish-Fisher expansion corrects for skewness by adjusting both
+    the quantile estimate and the local density. The adjusted quantile is:
+
+        ξ_p ≈ mu + sigma * [z_p + (z_p^2 - 1) * gamma / 6]
+
+    and the density correction factor is (1 + 2*z_p * gamma/6), which
+    accounts for the stretching/compression of the distribution at the
+    quantile point due to skewness.
+    """
+    mu = moments["mean"]
+    sigma = moments["std"]
+    gamma = moments["skewness"]
+
+    if sigma <= 0:
+        return {
+            "quantile_estimate_normal": mu,
+            "quantile_estimate_cf": mu,
+            "ci_width_absolute": 0.0,
+            "ci_width_relative": 0.0,
+            "se_quantile": 0.0,
+            "n_simulations": n_simulations,
+            "quantile": quantile,
+            "confidence_level": confidence_level,
+            "method": "degenerate",
+        }
+
+    z_p = stats.norm.ppf(quantile)
+    z_ci = stats.norm.ppf(1 - (1 - confidence_level) / 2)
+    phi_zp = stats.norm.pdf(z_p)
+
+    # Normal approximation quantile
+    quantile_normal = mu + sigma * z_p
+
+    # Cornish-Fisher corrected quantile (accounts for skewness)
+    cf_adjustment = (z_p**2 - 1) * gamma / 6
+    w_p = z_p + cf_adjustment
+    quantile_cf = mu + sigma * w_p
+
+    # Density correction factor for Cornish-Fisher
+    # dw/dz = 1 + 2*z_p*gamma/6, so the local density at the CF quantile
+    # is phi(z_p) / (sigma * |dw/dz|)
+    density_correction = 1 + 2 * z_p * gamma / 6
+
+    # Guard against non-positive density correction (extreme skewness)
+    if density_correction <= 0:
+        # Fall back to normal approximation
+        se = np.sqrt(quantile * (1 - quantile) / n_simulations) * sigma / phi_zp
+        quantile_est = quantile_normal
+        method = "normal"
+    else:
+        se = (
+            np.sqrt(quantile * (1 - quantile) / n_simulations)
+            * sigma
+            * density_correction
+            / phi_zp
+        )
+        quantile_est = quantile_cf
+        method = "cornish_fisher"
+
+    ci_width = 2 * z_ci * se
+
+    if quantile_est != 0:
+        ci_width_relative = (ci_width / quantile_est) * 100
+    else:
+        ci_width_relative = float("inf") if ci_width > 0 else 0.0
+
+    return {
+        "quantile_estimate_normal": float(quantile_normal),
+        "quantile_estimate_cf": float(quantile_cf),
+        "ci_width_absolute": float(ci_width),
+        "ci_width_relative": float(ci_width_relative),
+        "se_quantile": float(se),
+        "n_simulations": n_simulations,
+        "quantile": quantile,
+        "confidence_level": confidence_level,
+        "method": method,
+    }
+
+
 def estimate_required_simulations(
     pilot_results: dict,
     metric: str,
@@ -454,12 +646,16 @@ def generate_confidence_summary(
     quantile: float = 0.95,
     confidence_level: float = 0.95,
     simulation_scenarios: list[int] | None = None,
+    portfolio_data: dict | None = None,
 ) -> dict:
     """
     Generate a comprehensive confidence analysis summary.
 
     Analyzes the current simulation results and projects confidence intervals
-    for different simulation counts (10K, 100K, 1M by default).
+    for different simulation counts (10K, 100K, 1M by default). When portfolio
+    data is provided, includes analytical projections derived from the exact
+    moments of the heterogeneous Bernoulli portfolio, accounting for skewness
+    via the Cornish-Fisher expansion.
 
     Parameters
     ----------
@@ -473,6 +669,12 @@ def generate_confidence_summary(
         Confidence level for intervals.
     simulation_scenarios : list[int], optional
         Simulation counts to project. Default: [10_000, 100_000, 1_000_000].
+    portfolio_data : dict, optional
+        Portfolio structure for analytical projections. Must contain:
+        - 'volumes': array-like of claim volumes per life
+        - 'qx': array-like of mortality rates per life
+        When provided, the summary includes analytical CI projections that
+        account for individual-life heterogeneity and distribution skewness.
 
     Returns
     -------
@@ -483,18 +685,25 @@ def generate_confidence_summary(
         - 'recommendation': Suggested simulation count based on use case
         - 'metric': Metric analyzed
         - 'quantile': Quantile analyzed
+        - 'portfolio_moments': (if portfolio_data provided) Exact moments
+        - 'analytical_scenarios': (if portfolio_data provided) Analytical projections
 
     Examples
     --------
     >>> results = stochastic_runs_hybrid(data, n_trials=10000, ...)
-    >>> summary = generate_confidence_summary(results, "claim_volume_shocked")
-    >>> for scenario in summary['scenarios']:
-    ...     print(f"{scenario['n_simulations']:>10,}: CI width ≈ {scenario['projected_ci_width_relative']:.2f}%")
+    >>> summary = generate_confidence_summary(
+    ...     results, "claim_volume_shocked",
+    ...     portfolio_data={
+    ...         "volumes": data["volume"].values,
+    ...         "qx": data["shocked_qx"].values,
+    ...     },
+    ... )
+    >>> print_confidence_summary(summary)
     """
     if simulation_scenarios is None:
         simulation_scenarios = [10_000, 100_000, 1_000_000]
 
-    # Current analysis
+    # Current analysis (empirical, from simulation results)
     current = analyze_simulation_confidence(
         results, metric, quantile, confidence_level
     )
@@ -502,14 +711,11 @@ def generate_confidence_summary(
     current_n = current["n_simulations"]
     current_width_rel = current["ci_width_relative"]
 
-    # Project CI widths for each scenario
-    # CI width scales as 1/sqrt(n)
+    # Empirical projections (1/sqrt(n) scaling from observed CI)
     scenarios = []
     for n_sim in simulation_scenarios:
         scaling = np.sqrt(current_n / n_sim)
         projected_width = current_width_rel * scaling
-
-        # Also project absolute CI width
         projected_abs_width = current["ci_width"] * scaling
 
         scenarios.append({
@@ -522,7 +728,7 @@ def generate_confidence_summary(
     # Generate recommendation based on common use cases
     recommendation = _generate_recommendation(scenarios, quantile)
 
-    return {
+    summary = {
         "metric": metric,
         "quantile": quantile,
         "confidence_level": confidence_level,
@@ -530,6 +736,37 @@ def generate_confidence_summary(
         "scenarios": scenarios,
         "recommendation": recommendation,
     }
+
+    # Analytical projections (if portfolio data provided)
+    if portfolio_data is not None:
+        volumes = np.asarray(portfolio_data["volumes"])
+        qx = np.asarray(portfolio_data["qx"])
+
+        moments = compute_portfolio_moments(volumes, qx)
+        summary["portfolio_moments"] = moments
+
+        analytical_scenarios = []
+        for n_sim in simulation_scenarios:
+            ci_est = estimate_quantile_ci_width(
+                moments, n_sim, quantile, confidence_level
+            )
+            analytical_scenarios.append(ci_est)
+
+        summary["analytical_scenarios"] = analytical_scenarios
+
+        # Analytical recommendation uses analytical CI widths
+        analytical_scenario_dicts = [
+            {
+                "n_simulations": s["n_simulations"],
+                "projected_ci_width_relative": s["ci_width_relative"],
+            }
+            for s in analytical_scenarios
+        ]
+        summary["analytical_recommendation"] = _generate_recommendation(
+            analytical_scenario_dicts, quantile
+        )
+
+    return summary
 
 
 def _generate_recommendation(scenarios: list[dict], quantile: float) -> dict:
@@ -587,18 +824,40 @@ def print_confidence_summary(summary: dict) -> None:
     """
     Print a formatted confidence analysis summary.
 
+    When the summary includes analytical projections (from portfolio_data),
+    displays both empirical and analytical CI widths side-by-side for
+    comparison.
+
     Parameters
     ----------
     summary : dict
         Output from generate_confidence_summary().
     """
     current = summary["current_analysis"]
+    has_analytical = "analytical_scenarios" in summary
     print("=" * 70)
-    print(f"SIMULATION CONFIDENCE ANALYSIS")
+    print("SIMULATION CONFIDENCE ANALYSIS")
     print(f"Metric: {summary['metric']}")
     print(f"Quantile: {summary['quantile'] * 100:.0f}th percentile")
     print(f"Confidence Level: {summary['confidence_level'] * 100:.0f}%")
     print("=" * 70)
+
+    # Portfolio moments section (if available)
+    if has_analytical:
+        moments = summary["portfolio_moments"]
+        print(f"\nPORTFOLIO STRUCTURE ({moments['n_lives']:,} lives)")
+        print("-" * 50)
+        print(f"  Analytical mean:    {moments['mean']:>20,.2f}")
+        print(f"  Analytical std dev: {moments['std']:>20,.2f}")
+        print(f"  Coeff. of variation:{moments['cv']:>19.4f}")
+        print(f"  Skewness:           {moments['skewness']:>20.4f}")
+
+        # Show analytical vs simulation quantile estimates
+        a_scen = summary["analytical_scenarios"][0]
+        print(f"\n  Quantile estimates:")
+        print(f"    Simulation (empirical):  {current['point_estimate']:>16,.2f}")
+        print(f"    Normal approximation:    {a_scen['quantile_estimate_normal']:>16,.2f}")
+        print(f"    Cornish-Fisher adjusted: {a_scen['quantile_estimate_cf']:>16,.2f}")
 
     print(f"\nCURRENT RESULTS ({current['n_simulations']:,} simulations)")
     print("-" * 50)
@@ -608,21 +867,46 @@ def print_confidence_summary(summary: dict) -> None:
     print(f"  CI width:           {current['ci_width']:>20,.2f}")
     print(f"  CI width (relative):{current['ci_width_relative']:>19.2f}%")
 
+    # Side-by-side projection table
     print(f"\nPROJECTED CI WIDTH BY SIMULATION COUNT")
-    print("-" * 50)
-    print(f"  {'Simulations':>15}  {'CI Width (%)':>15}  {'Status':<15}")
-    for scenario in summary["scenarios"]:
-        status = "← current" if scenario["is_current"] else ""
+    print("-" * 70)
+    if has_analytical:
         print(
-            f"  {scenario['n_simulations']:>15,}  "
-            f"{scenario['projected_ci_width_relative']:>14.2f}%  "
-            f"{status:<15}"
+            f"  {'Simulations':>15}  "
+            f"{'Empirical (%)':>15}  "
+            f"{'Analytical (%)':>15}  "
+            f"{'Status':<10}"
         )
+        for emp, ana in zip(summary["scenarios"], summary["analytical_scenarios"]):
+            status = "current" if emp["is_current"] else ""
+            print(
+                f"  {emp['n_simulations']:>15,}  "
+                f"{emp['projected_ci_width_relative']:>14.2f}%  "
+                f"{ana['ci_width_relative']:>14.2f}%  "
+                f"{status:<10}"
+            )
+    else:
+        print(f"  {'Simulations':>15}  {'CI Width (%)':>15}  {'Status':<15}")
+        for scenario in summary["scenarios"]:
+            status = "current" if scenario["is_current"] else ""
+            print(
+                f"  {scenario['n_simulations']:>15,}  "
+                f"{scenario['projected_ci_width_relative']:>14.2f}%  "
+                f"{status:<15}"
+            )
 
-    print(f"\nRECOMMENDATIONS BY USE CASE")
+    # Recommendations
+    rec_source = "analytical_recommendation" if has_analytical else "recommendation"
+    rec_label = "ANALYTICAL" if has_analytical else "EMPIRICAL"
+    recs = summary.get(rec_source, summary["recommendation"])
+
+    print(f"\nRECOMMENDATIONS BY USE CASE ({rec_label})")
     print("-" * 50)
-    for use_case, rec in summary["recommendation"].items():
+    for use_case, rec in recs.items():
         extra = " (extrapolated)" if rec.get("extrapolated") else ""
         print(f"  {rec['description']}:")
-        print(f"    → {rec['recommended_n']:,} simulations (CI ≤ {rec['threshold']}%){extra}")
+        print(
+            f"    -> {rec['recommended_n']:,} simulations "
+            f"(CI <= {rec['threshold']}%){extra}"
+        )
     print("=" * 70)
