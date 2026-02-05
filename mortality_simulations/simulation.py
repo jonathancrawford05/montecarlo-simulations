@@ -9,6 +9,7 @@ results, particularly for tail quantiles used in risk management.
 """
 
 import os
+import warnings
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
@@ -549,6 +550,110 @@ def estimate_quantile_ci_width(
     }
 
 
+def plan_simulation_count(
+    volumes: np.ndarray,
+    qx: np.ndarray,
+    quantile: float = 0.95,
+    confidence_level: float = 0.95,
+    target_ci_width_relative: float = 1.0,
+    simulation_scenarios: list[int] | None = None,
+) -> dict:
+    """
+    Plan the required number of simulations from portfolio data alone.
+
+    This is the recommended entry point for answering "how many simulations
+    do I need?" It uses the exact analytical moments of the aggregate claim
+    distribution (no simulation required) to project CI widths and recommend
+    a simulation count for the target precision.
+
+    Unlike :func:`estimate_required_simulations`, which extrapolates from a
+    pilot run and is subject to sampling variability, this function gives
+    deterministic results derived directly from the portfolio structure.
+
+    Parameters
+    ----------
+    volumes : array-like
+        Claim volume for each life.
+    qx : array-like
+        Mortality rate for each life.
+    quantile : float, default=0.95
+        Target quantile (0 to 1).
+    confidence_level : float, default=0.95
+        Confidence level for the interval (0 to 1).
+    target_ci_width_relative : float, default=1.0
+        Target CI width as percentage of quantile estimate.
+    simulation_scenarios : list[int], optional
+        Simulation counts to evaluate. Default: [1_000, 10_000, 100_000, 1_000_000].
+
+    Returns
+    -------
+    dict
+        Planning results containing:
+        - 'portfolio_moments': Exact moments from compute_portfolio_moments()
+        - 'target_ci_width_relative': Target CI width (%)
+        - 'recommended_n': Smallest scenario achieving target, or extrapolated n
+        - 'scenarios': List of dicts with CI width at each scenario count
+        - 'quantile': Target quantile
+        - 'confidence_level': Confidence level
+
+    Examples
+    --------
+    >>> plan = plan_simulation_count(
+    ...     data["volume"].values,
+    ...     data["shocked_qx"].values,
+    ...     target_ci_width_relative=1.0,
+    ... )
+    >>> print(f"Recommended: {plan['recommended_n']:,} simulations")
+    """
+    if simulation_scenarios is None:
+        simulation_scenarios = [1_000, 10_000, 100_000, 1_000_000]
+
+    volumes = np.asarray(volumes, dtype=float)
+    qx = np.asarray(qx, dtype=float)
+
+    moments = compute_portfolio_moments(volumes, qx)
+
+    scenarios = []
+    for n_sim in simulation_scenarios:
+        ci_est = estimate_quantile_ci_width(
+            moments, n_sim, quantile, confidence_level
+        )
+        scenarios.append({
+            "n_simulations": n_sim,
+            "ci_width_relative": ci_est["ci_width_relative"],
+            "ci_width_absolute": ci_est["ci_width_absolute"],
+            "se_quantile": ci_est["se_quantile"],
+            "quantile_estimate": ci_est["quantile_estimate_cf"],
+        })
+
+    # Find recommended n: smallest scenario that achieves the target
+    suitable = [
+        s for s in scenarios
+        if s["ci_width_relative"] <= target_ci_width_relative
+    ]
+    if suitable:
+        recommended_n = min(suitable, key=lambda x: x["n_simulations"])["n_simulations"]
+    else:
+        # Extrapolate from the largest scenario using 1/sqrt(n) scaling
+        best = min(scenarios, key=lambda x: x["ci_width_relative"])
+        ratio = best["ci_width_relative"] / target_ci_width_relative
+        recommended_n = int(np.ceil(best["n_simulations"] * ratio ** 2))
+
+    return {
+        "portfolio_moments": moments,
+        "target_ci_width_relative": target_ci_width_relative,
+        "recommended_n": recommended_n,
+        "scenarios": scenarios,
+        "quantile": quantile,
+        "confidence_level": confidence_level,
+    }
+
+
+# Minimum pilot sizes for estimate_required_simulations stability
+_PILOT_MIN = 1_000
+_PILOT_RECOMMENDED = 5_000
+
+
 def estimate_required_simulations(
     pilot_results: dict,
     metric: str,
@@ -557,11 +662,15 @@ def estimate_required_simulations(
     confidence_level: float = 0.95,
 ) -> dict:
     """
-    Estimate number of simulations required for a target confidence interval width.
+    Estimate required simulations by extrapolating from a pilot run.
 
-    Uses pilot run results to estimate the density at the quantile, then
-    applies the asymptotic formula for quantile standard error to determine
-    the required sample size.
+    Measures the empirical CI width from the pilot and extrapolates via
+    1/sqrt(n) scaling. Best used to **validate** that a completed run
+    achieved the target precision.
+
+    For **planning** (before running any simulations), prefer
+    :func:`plan_simulation_count`, which uses exact analytical moments
+    and produces deterministic results with no sampling variability.
 
     Parameters
     ----------
@@ -587,6 +696,8 @@ def estimate_required_simulations(
         - 'scaling_factor': Ratio of required to pilot simulations
         - 'quantile': Target quantile
         - 'confidence_level': Confidence level
+        - 'pilot_stability': 'low' (<1,000), 'moderate' (1,000-4,999),
+          or 'high' (>=5,000)
 
     Notes
     -----
@@ -596,9 +707,18 @@ def estimate_required_simulations(
     Since CI width ∝ 1/sqrt(n), to reduce width by factor k requires
     k² times more simulations.
 
+    Pilot stability:
+        The empirical CI width is itself a random variable. Small pilots
+        (<1,000 sims) can produce estimates that vary by 60%+ across
+        replicates. At 5,000+ the CV drops below 25%.
+
+    See Also
+    --------
+    plan_simulation_count : Deterministic planning using analytical moments.
+
     Examples
     --------
-    >>> pilot = stochastic_runs_hybrid(data, n_trials=1000, ...)
+    >>> pilot = stochastic_runs_hybrid(data, n_trials=5000, ...)
     >>> est = estimate_required_simulations(
     ...     pilot, "claim_volume_shocked", target_ci_width_relative=1.0
     ... )
@@ -612,6 +732,23 @@ def estimate_required_simulations(
     pilot_n = current_ci["n_simulations"]
     current_width_rel = current_ci["ci_width_relative"]
 
+    # Assess pilot stability
+    if pilot_n < _PILOT_MIN:
+        pilot_stability = "low"
+        warnings.warn(
+            f"Pilot size ({pilot_n:,}) is below the minimum recommended "
+            f"({_PILOT_MIN:,}). Estimates may be unreliable (CV > 30%). "
+            f"Consider using plan_simulation_count() for deterministic "
+            f"planning, or increase pilot to {_PILOT_RECOMMENDED:,}+ "
+            f"simulations.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif pilot_n < _PILOT_RECOMMENDED:
+        pilot_stability = "moderate"
+    else:
+        pilot_stability = "high"
+
     if current_width_rel == 0:
         return {
             "pilot_n": pilot_n,
@@ -621,6 +758,7 @@ def estimate_required_simulations(
             "scaling_factor": 1.0,
             "quantile": quantile,
             "confidence_level": confidence_level,
+            "pilot_stability": pilot_stability,
             "note": "CI width is zero; pilot may be sufficient or data has no variability",
         }
 
@@ -637,6 +775,7 @@ def estimate_required_simulations(
         "scaling_factor": float(scaling_factor),
         "quantile": quantile,
         "confidence_level": confidence_level,
+        "pilot_stability": pilot_stability,
     }
 
 

@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import warnings
+
 from mortality_simulations import (
     analyze_simulation_confidence,
     check_threading_config,
@@ -12,6 +14,7 @@ from mortality_simulations import (
     estimate_required_simulations,
     generate_confidence_summary,
     get_optimal_params,
+    plan_simulation_count,
     print_confidence_summary,
     stochastic_runs_hybrid,
 )
@@ -846,3 +849,200 @@ class TestAnalyticalVsEmpiricalIntegration:
         assert "Skewness" in captured.out
         assert "Analytical" in captured.out
         assert "Cornish-Fisher" in captured.out
+
+
+class TestPlanSimulationCount:
+    """Tests for the plan_simulation_count function."""
+
+    @pytest.fixture
+    def portfolio_arrays(self, sample_data):
+        """Extract portfolio arrays from sample data."""
+        return {
+            "volumes": sample_data["volume"].values,
+            "qx": sample_data["shocked_qx"].values,
+        }
+
+    def test_returns_expected_keys(self, portfolio_arrays):
+        """Test that results contain all expected keys."""
+        plan = plan_simulation_count(**portfolio_arrays)
+
+        expected_keys = {
+            "portfolio_moments",
+            "target_ci_width_relative",
+            "recommended_n",
+            "scenarios",
+            "quantile",
+            "confidence_level",
+        }
+        assert set(plan.keys()) == expected_keys
+
+    def test_default_scenarios(self, portfolio_arrays):
+        """Test default scenarios are 1K, 10K, 100K, 1M."""
+        plan = plan_simulation_count(**portfolio_arrays)
+
+        scenario_ns = [s["n_simulations"] for s in plan["scenarios"]]
+        assert scenario_ns == [1_000, 10_000, 100_000, 1_000_000]
+
+    def test_custom_scenarios(self, portfolio_arrays):
+        """Test custom simulation scenarios."""
+        custom = [5_000, 50_000]
+        plan = plan_simulation_count(
+            **portfolio_arrays, simulation_scenarios=custom
+        )
+
+        scenario_ns = [s["n_simulations"] for s in plan["scenarios"]]
+        assert scenario_ns == custom
+
+    def test_ci_width_decreases_with_n(self, portfolio_arrays):
+        """Test that CI width decreases across scenarios."""
+        plan = plan_simulation_count(**portfolio_arrays)
+
+        widths = [s["ci_width_relative"] for s in plan["scenarios"]]
+        for i in range(len(widths) - 1):
+            assert widths[i] > widths[i + 1]
+
+    def test_recommended_n_achieves_target(self, portfolio_arrays):
+        """Test that recommended_n achieves the target CI width."""
+        target = 1.0
+        plan = plan_simulation_count(
+            **portfolio_arrays, target_ci_width_relative=target
+        )
+
+        # The recommended_n should produce CI width <= target
+        moments = plan["portfolio_moments"]
+        ci = estimate_quantile_ci_width(moments, plan["recommended_n"])
+        assert ci["ci_width_relative"] <= target
+
+    def test_tighter_target_requires_more_simulations(self, portfolio_arrays):
+        """Test that tighter targets produce higher recommended_n."""
+        plan_5 = plan_simulation_count(
+            **portfolio_arrays, target_ci_width_relative=5.0
+        )
+        plan_1 = plan_simulation_count(
+            **portfolio_arrays, target_ci_width_relative=1.0
+        )
+
+        assert plan_1["recommended_n"] >= plan_5["recommended_n"]
+
+    def test_deterministic(self, portfolio_arrays):
+        """Test that results are identical across calls (no sampling)."""
+        plan_a = plan_simulation_count(**portfolio_arrays)
+        plan_b = plan_simulation_count(**portfolio_arrays)
+
+        assert plan_a["recommended_n"] == plan_b["recommended_n"]
+        for sa, sb in zip(plan_a["scenarios"], plan_b["scenarios"]):
+            assert sa["ci_width_relative"] == sb["ci_width_relative"]
+
+    def test_includes_portfolio_moments(self, portfolio_arrays):
+        """Test that portfolio_moments is included and has expected keys."""
+        plan = plan_simulation_count(**portfolio_arrays)
+
+        moments = plan["portfolio_moments"]
+        assert "mean" in moments
+        assert "std" in moments
+        assert "skewness" in moments
+
+    def test_scenario_entries_have_expected_keys(self, portfolio_arrays):
+        """Test that each scenario entry has expected keys."""
+        plan = plan_simulation_count(**portfolio_arrays)
+
+        expected_keys = {
+            "n_simulations",
+            "ci_width_relative",
+            "ci_width_absolute",
+            "se_quantile",
+            "quantile_estimate",
+        }
+        for scenario in plan["scenarios"]:
+            assert set(scenario.keys()) == expected_keys
+
+    def test_extrapolation_when_target_not_in_scenarios(self, portfolio_arrays):
+        """Test extrapolation when no scenario achieves the target."""
+        # Use very small scenarios that won't achieve 0.1% CI width
+        plan = plan_simulation_count(
+            **portfolio_arrays,
+            target_ci_width_relative=0.01,
+            simulation_scenarios=[100, 1_000],
+        )
+
+        # recommended_n should be extrapolated beyond the largest scenario
+        assert plan["recommended_n"] > 1_000
+
+
+class TestEstimateRequiredSimulationsPilotStability:
+    """Tests for pilot stability validation in estimate_required_simulations."""
+
+    def test_small_pilot_warns(self, sample_data):
+        """Test that pilot < 1,000 raises a UserWarning."""
+        np.random.seed(42)
+        small_pilot = stochastic_runs_hybrid(
+            data=sample_data,
+            n_trials=100,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_processes=1,
+        )
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            est = estimate_required_simulations(
+                small_pilot, "claim_volume_shocked"
+            )
+            assert len(w) == 1
+            assert "below the minimum" in str(w[0].message)
+            assert "plan_simulation_count" in str(w[0].message)
+
+    def test_small_pilot_stability_low(self, sample_data):
+        """Test that pilot < 1,000 gets stability 'low'."""
+        np.random.seed(42)
+        small_pilot = stochastic_runs_hybrid(
+            data=sample_data,
+            n_trials=100,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_processes=1,
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            est = estimate_required_simulations(
+                small_pilot, "claim_volume_shocked"
+            )
+
+        assert est["pilot_stability"] == "low"
+
+    def test_moderate_pilot_stability(self, simulation_results):
+        """Test that pilot 1,000-4,999 gets stability 'moderate'."""
+        # simulation_results fixture uses n_trials=1000
+        est = estimate_required_simulations(
+            simulation_results, "claim_volume_shocked"
+        )
+        assert est["pilot_stability"] == "moderate"
+
+    def test_large_pilot_stability_high(self, sample_data):
+        """Test that pilot >= 5,000 gets stability 'high'."""
+        np.random.seed(42)
+        large_pilot = stochastic_runs_hybrid(
+            data=sample_data,
+            n_trials=5_000,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_processes=1,
+        )
+
+        est = estimate_required_simulations(
+            large_pilot, "claim_volume_shocked"
+        )
+        assert est["pilot_stability"] == "high"
+
+    def test_moderate_pilot_does_not_warn(self, simulation_results):
+        """Test that pilot >= 1,000 does not warn."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            estimate_required_simulations(
+                simulation_results, "claim_volume_shocked"
+            )
+            assert len(w) == 0
