@@ -17,13 +17,16 @@ This project implements stochastic mortality simulations designed to efficiently
 mortality_simulations/
 ├── mortality_simulations/     # Main package
 │   ├── __init__.py
-│   ├── simulation.py          # Single life simulation
-│   └── joint_life.py          # Joint life simulation with contagion
+│   ├── joint_life.py          # Joint life simulation with contagion
+│   └── simulation.py          # Core simulation + confidence analysis
 ├── tests/                     # Unit tests
 ├── benchmarks/                # Performance benchmarks and calibration
+├── examples/                  # Jupyter notebooks
+│   └── confidence_analysis.ipynb
 ├── docs/                      # Documentation
-│   ├── calibration.md         # Performance calibration guide
-│   └── joint_life.md          # Joint life modeling guide
+│   ├── joint_life.md          # Joint life modeling guide
+│   ├── calibration.md         # Calibration guide and benchmark results
+│   └── confidence_analysis.md # Statistical background and methodology
 ├── data/                      # Sample data (gitignored)
 ├── pyproject.toml             # Poetry configuration
 └── README.md
@@ -169,6 +172,72 @@ results = stochastic_runs_portfolio(
 ```
 
 For detailed documentation on joint life modeling, correlation estimation, and contagion effects, see [docs/joint_life.md](docs/joint_life.md).
+
+## Confidence Analysis
+
+The package includes tools for quantifying uncertainty in simulation results — specifically, how confident you can be in tail quantiles (e.g., the 95th percentile) used for risk management.
+
+There are two workflows:
+
+### Planning: How many simulations do I need?
+
+Use `plan_simulation_count` **before** running simulations. It computes exact analytical moments from the portfolio data (no simulation required) and projects CI widths for different simulation counts:
+
+```python
+from mortality_simulations import plan_simulation_count
+
+plan = plan_simulation_count(
+    data["volume"].values,
+    data["shocked_qx"].values,
+    target_ci_width_relative=1.0,  # Target: 1% CI width for the 95th pctile
+)
+
+print(f"Recommended: {plan['recommended_n']:,} simulations")
+for s in plan["scenarios"]:
+    print(f"  {s['n_simulations']:>10,} sims -> CI width {s['ci_width_relative']:.2f}%")
+```
+
+This is deterministic — same portfolio, same answer every time. It accounts for heterogeneous mortality rates and volume concentration via the Cornish-Fisher expansion. See [docs/confidence_analysis.md](docs/confidence_analysis.md) for the statistical methodology.
+
+### Validation: Did my simulation achieve the target?
+
+After running simulations, use `generate_confidence_summary` to verify the precision achieved, optionally comparing against the analytical projection:
+
+```python
+from mortality_simulations import (
+    stochastic_runs_hybrid,
+    generate_confidence_summary,
+    print_confidence_summary,
+)
+
+results = stochastic_runs_hybrid(data, n_trials=100_000, ...)
+
+summary = generate_confidence_summary(
+    results,
+    "claim_volume_shocked",
+    portfolio_data={
+        "volumes": data["volume"].values,
+        "qx": data["shocked_qx"].values,
+    },
+)
+print_confidence_summary(summary)
+```
+
+This prints a side-by-side comparison of empirical and analytical CI widths at 10K, 100K, and 1M simulations, with use-case recommendations.
+
+### Function Reference
+
+| Function | Purpose |
+|----------|---------|
+| `plan_simulation_count` | **Planning.** Deterministic simulation count recommendation from portfolio data |
+| `compute_portfolio_moments` | Exact mean, variance, skewness of the aggregate claim distribution |
+| `estimate_quantile_ci_width` | Analytical CI width for a quantile at any simulation count |
+| `analyze_simulation_confidence` | Empirical CI for a quantile from simulation results (order statistics) |
+| `estimate_required_simulations` | Extrapolate required n from a pilot run (warns if pilot < 1,000) |
+| `generate_confidence_summary` | Full report with projections and recommendations |
+| `print_confidence_summary` | Formatted console output |
+
+For worked examples, see [examples/confidence_analysis.ipynb](examples/confidence_analysis.ipynb).
 
 ## Development
 

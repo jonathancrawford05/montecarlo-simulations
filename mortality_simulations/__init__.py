@@ -8,6 +8,7 @@ from mortality_simulations.simulation import (
     estimate_required_simulations,
     generate_confidence_summary,
     get_optimal_params,
+    plan_simulation_count,
     print_confidence_summary,
     stochastic_runs_hybrid,
 )
@@ -24,7 +25,7 @@ from mortality_simulations.joint_life import (
 
 __version__ = "0.1.0"
 __all__ = [
-    # Single life simulation
+    # Simulation
     "stochastic_runs_hybrid",
     "get_optimal_params",
     "check_threading_config",
@@ -34,17 +35,15 @@ __all__ = [
     "generate_correlated_uniforms",
     "prepare_joint_life_data",
     "apply_contagion",
-    # Parameter configurations
-    "get_joint_life_params",
-    "list_param_configs",
-    "PARAM_CONFIGS",
-    # confidence analysis
+    # Confidence analysis — planning (analytical, no simulation needed)
+    "plan_simulation_count",
+    "compute_portfolio_moments",
+    "estimate_quantile_ci_width",
+    # Confidence analysis — validation (from simulation results)
     "analyze_simulation_confidence",
     "estimate_required_simulations",
     "generate_confidence_summary",
     "print_confidence_summary",
-    "compute_portfolio_moments",
-    "estimate_quantile_ci_width",
     # Parameter configurations
     "get_joint_life_params",
     "list_param_configs",
