@@ -133,12 +133,12 @@ def _worker_vectorized_batch(args):
             axis=0
         )
         results["claim_count_shocked"][batch_start:batch_end] = dead_shocked.sum(axis=0)
-        results["claim_volume_baseline"][batch_start:batch_end] = (
-            dead_baseline * volumes[:, np.newaxis]
-        ).sum(axis=0)
-        results["claim_volume_shocked"][batch_start:batch_end] = (
-            dead_shocked * volumes[:, np.newaxis]
-        ).sum(axis=0)
+        results["claim_volume_baseline"][batch_start:batch_end] = np.nansum(
+            dead_baseline * volumes[:, np.newaxis], axis=0
+        )
+        results["claim_volume_shocked"][batch_start:batch_end] = np.nansum(
+            dead_shocked * volumes[:, np.newaxis], axis=0
+        )
 
         large_baseline = dead_baseline & large_mask[:, np.newaxis]
         large_shocked = dead_shocked & large_mask[:, np.newaxis]
@@ -149,12 +149,12 @@ def _worker_vectorized_batch(args):
         results["claim_count_shocked_10PLUS"][batch_start:batch_end] = (
             large_shocked.sum(axis=0)
         )
-        results["volume_baseline_10PLUS"][batch_start:batch_end] = (
-            large_baseline * volumes[:, np.newaxis]
-        ).sum(axis=0)
-        results["volume_shocked_10PLUS"][batch_start:batch_end] = (
-            large_shocked * volumes[:, np.newaxis]
-        ).sum(axis=0)
+        results["volume_baseline_10PLUS"][batch_start:batch_end] = np.nansum(
+            large_baseline * volumes[:, np.newaxis], axis=0
+        )
+        results["volume_shocked_10PLUS"][batch_start:batch_end] = np.nansum(
+            large_shocked * volumes[:, np.newaxis], axis=0
+        )
 
     return results
 
