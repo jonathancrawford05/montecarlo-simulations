@@ -3,6 +3,8 @@
 from mortality_simulations.simulation import (
     analyze_simulation_confidence,
     check_threading_config,
+    compute_portfolio_moments,
+    estimate_quantile_ci_width,
     estimate_required_simulations,
     generate_confidence_summary,
     get_optimal_params,
@@ -19,4 +21,6 @@ __all__ = [
     "estimate_required_simulations",
     "generate_confidence_summary",
     "print_confidence_summary",
+    "compute_portfolio_moments",
+    "estimate_quantile_ci_width",
 ]

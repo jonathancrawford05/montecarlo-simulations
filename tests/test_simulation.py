@@ -7,6 +7,8 @@ import pytest
 from mortality_simulations import (
     analyze_simulation_confidence,
     check_threading_config,
+    compute_portfolio_moments,
+    estimate_quantile_ci_width,
     estimate_required_simulations,
     generate_confidence_summary,
     get_optimal_params,
@@ -500,3 +502,347 @@ class TestPrintConfidenceSummary:
         assert "CURRENT RESULTS" in captured.out
         assert "PROJECTED CI WIDTH" in captured.out
         assert "RECOMMENDATIONS BY USE CASE" in captured.out
+
+
+class TestComputePortfolioMoments:
+    """Tests for the compute_portfolio_moments function."""
+
+    def test_returns_expected_keys(self):
+        """Test that results contain all expected keys."""
+        volumes = np.array([1_000_000, 2_000_000, 5_000_000])
+        qx = np.array([0.01, 0.02, 0.03])
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        expected_keys = {
+            "mean", "variance", "std", "skewness",
+            "third_central_moment", "n_lives", "cv",
+        }
+        assert set(moments.keys()) == expected_keys
+
+    def test_mean_calculation(self):
+        """Test exact mean: E[S] = sum(v_i * qx_i)."""
+        volumes = np.array([1_000_000.0, 2_000_000.0])
+        qx = np.array([0.01, 0.02])
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        expected_mean = 1_000_000 * 0.01 + 2_000_000 * 0.02
+        assert abs(moments["mean"] - expected_mean) < 0.01
+
+    def test_variance_calculation(self):
+        """Test exact variance: Var(S) = sum(v_i^2 * qx_i * (1-qx_i))."""
+        volumes = np.array([1_000_000.0, 2_000_000.0])
+        qx = np.array([0.01, 0.02])
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        expected_var = (
+            1_000_000**2 * 0.01 * 0.99
+            + 2_000_000**2 * 0.02 * 0.98
+        )
+        assert abs(moments["variance"] - expected_var) / expected_var < 1e-10
+
+    def test_std_is_sqrt_variance(self):
+        """Test that std = sqrt(variance)."""
+        volumes = np.array([5_000_000.0, 10_000_000.0, 15_000_000.0])
+        qx = np.array([0.005, 0.01, 0.02])
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        assert abs(moments["std"] - np.sqrt(moments["variance"])) < 0.01
+
+    def test_skewness_positive_for_low_qx(self):
+        """Test skewness is positive for low mortality rates.
+
+        For Bernoulli(p) with small p, the distribution is right-skewed.
+        The third central moment sum(v^3 * p*(1-p)*(1-2p)) is positive
+        when most qx < 0.5, producing positive skewness.
+        """
+        volumes = np.ones(100) * 1_000_000
+        qx = np.ones(100) * 0.01
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        assert moments["skewness"] > 0
+
+    def test_n_lives_correct(self):
+        """Test n_lives matches input length."""
+        n = 500
+        moments = compute_portfolio_moments(np.ones(n), np.ones(n) * 0.01)
+        assert moments["n_lives"] == n
+
+    def test_cv_calculation(self):
+        """Test coefficient of variation = std / mean."""
+        volumes = np.array([1_000_000.0, 2_000_000.0, 3_000_000.0])
+        qx = np.array([0.01, 0.02, 0.03])
+
+        moments = compute_portfolio_moments(volumes, qx)
+
+        assert abs(moments["cv"] - moments["std"] / moments["mean"]) < 1e-10
+
+    def test_length_mismatch_raises(self):
+        """Test that mismatched array lengths raise ValueError."""
+        with pytest.raises(ValueError, match="same length"):
+            compute_portfolio_moments(np.ones(10), np.ones(5) * 0.01)
+
+    def test_heterogeneous_vs_homogeneous_variance(self):
+        """Test that heterogeneous qx produces different variance than homogeneous.
+
+        A portfolio with varied qx values has different variance than one
+        with all lives at the mean qx, demonstrating that the analytical
+        approach captures heterogeneity.
+        """
+        n = 1000
+        volumes = np.ones(n) * 1_000_000
+
+        # Heterogeneous: qx ranges from 0.001 to 0.05
+        np.random.seed(42)
+        qx_hetero = np.random.uniform(0.001, 0.05, n)
+
+        # Homogeneous: all at the mean
+        qx_homo = np.ones(n) * qx_hetero.mean()
+
+        moments_hetero = compute_portfolio_moments(volumes, qx_hetero)
+        moments_homo = compute_portfolio_moments(volumes, qx_homo)
+
+        # Same mean (since sum of v*qx is same when mean qx is same)
+        assert abs(moments_hetero["mean"] - moments_homo["mean"]) < 0.01
+
+        # Different variance (hetero has higher variance due to Jensen's inequality
+        # on the qx*(1-qx) term)
+        assert moments_hetero["variance"] != moments_homo["variance"]
+
+    def test_heterogeneous_vs_homogeneous_skewness(self):
+        """Test that heterogeneous qx produces different skewness than homogeneous."""
+        n = 1000
+        volumes = np.ones(n) * 1_000_000
+
+        np.random.seed(42)
+        qx_hetero = np.random.uniform(0.001, 0.05, n)
+        qx_homo = np.ones(n) * qx_hetero.mean()
+
+        moments_hetero = compute_portfolio_moments(volumes, qx_hetero)
+        moments_homo = compute_portfolio_moments(volumes, qx_homo)
+
+        # Different skewness due to heterogeneity
+        assert moments_hetero["skewness"] != moments_homo["skewness"]
+
+
+class TestEstimateQuantileCiWidth:
+    """Tests for the estimate_quantile_ci_width function."""
+
+    @pytest.fixture
+    def sample_moments(self):
+        """Create moments from a typical portfolio."""
+        np.random.seed(42)
+        n = 1000
+        volumes = np.random.uniform(100_000, 50_000_000, n)
+        qx = np.random.uniform(0.001, 0.05, n)
+        return compute_portfolio_moments(volumes, qx)
+
+    def test_returns_expected_keys(self, sample_moments):
+        """Test that results contain all expected keys."""
+        ci = estimate_quantile_ci_width(sample_moments, n_simulations=10_000)
+
+        expected_keys = {
+            "quantile_estimate_normal",
+            "quantile_estimate_cf",
+            "ci_width_absolute",
+            "ci_width_relative",
+            "se_quantile",
+            "n_simulations",
+            "quantile",
+            "confidence_level",
+            "method",
+        }
+        assert set(ci.keys()) == expected_keys
+
+    def test_ci_width_decreases_with_more_simulations(self, sample_moments):
+        """Test that CI width shrinks with more simulations."""
+        ci_10k = estimate_quantile_ci_width(sample_moments, 10_000)
+        ci_100k = estimate_quantile_ci_width(sample_moments, 100_000)
+        ci_1m = estimate_quantile_ci_width(sample_moments, 1_000_000)
+
+        assert ci_10k["ci_width_relative"] > ci_100k["ci_width_relative"]
+        assert ci_100k["ci_width_relative"] > ci_1m["ci_width_relative"]
+
+    def test_ci_width_scales_as_inverse_sqrt_n(self, sample_moments):
+        """Test that CI width follows 1/sqrt(n) scaling."""
+        ci_10k = estimate_quantile_ci_width(sample_moments, 10_000)
+        ci_100k = estimate_quantile_ci_width(sample_moments, 100_000)
+
+        # Width ratio should be sqrt(100k/10k) = sqrt(10) ≈ 3.162
+        ratio = ci_10k["ci_width_absolute"] / ci_100k["ci_width_absolute"]
+        expected_ratio = np.sqrt(100_000 / 10_000)
+        assert abs(ratio - expected_ratio) / expected_ratio < 0.01
+
+    def test_cornish_fisher_differs_from_normal(self, sample_moments):
+        """Test that Cornish-Fisher quantile differs from normal.
+
+        With positive skewness (typical for mortality portfolios), the
+        Cornish-Fisher 95th percentile should be higher than normal.
+        """
+        ci = estimate_quantile_ci_width(sample_moments, 10_000)
+
+        # With positive skewness, CF adjustment pushes the upper quantile higher
+        assert ci["quantile_estimate_cf"] != ci["quantile_estimate_normal"]
+
+    def test_method_is_cornish_fisher(self, sample_moments):
+        """Test that method is cornish_fisher for typical portfolios."""
+        ci = estimate_quantile_ci_width(sample_moments, 10_000)
+        assert ci["method"] == "cornish_fisher"
+
+    def test_higher_quantile_has_wider_relative_ci(self, sample_moments):
+        """Test that higher quantiles have wider relative CI.
+
+        The p(1-p) factor in the SE formula peaks at p=0.5.
+        For p > 0.5, p(1-p) decreases, but the quantile estimate also
+        increases. For extreme quantiles (0.99), the density is lower,
+        producing wider relative CI.
+        """
+        ci_95 = estimate_quantile_ci_width(
+            sample_moments, 10_000, quantile=0.95
+        )
+        ci_99 = estimate_quantile_ci_width(
+            sample_moments, 10_000, quantile=0.99
+        )
+
+        # 99th percentile should have wider relative CI than 95th
+        # because the density is lower in the tail
+        assert ci_99["ci_width_relative"] > ci_95["ci_width_relative"]
+
+    def test_zero_std_returns_degenerate(self):
+        """Test degenerate case when all lives have zero variance."""
+        moments = {
+            "mean": 100_000,
+            "variance": 0,
+            "std": 0,
+            "skewness": 0,
+            "third_central_moment": 0,
+            "n_lives": 10,
+            "cv": 0,
+        }
+
+        ci = estimate_quantile_ci_width(moments, 10_000)
+
+        assert ci["method"] == "degenerate"
+        assert ci["ci_width_absolute"] == 0.0
+
+    def test_se_positive(self, sample_moments):
+        """Test that standard error is positive."""
+        ci = estimate_quantile_ci_width(sample_moments, 10_000)
+        assert ci["se_quantile"] > 0
+
+
+class TestAnalyticalVsEmpiricalIntegration:
+    """Integration tests comparing analytical and empirical CI estimates."""
+
+    def test_summary_with_portfolio_data_includes_analytical(
+        self, sample_data, simulation_results
+    ):
+        """Test that portfolio_data triggers analytical sections in summary."""
+        summary = generate_confidence_summary(
+            simulation_results,
+            "claim_volume_shocked",
+            portfolio_data={
+                "volumes": sample_data["volume"].values,
+                "qx": sample_data["shocked_qx"].values,
+            },
+        )
+
+        assert "portfolio_moments" in summary
+        assert "analytical_scenarios" in summary
+        assert "analytical_recommendation" in summary
+
+    def test_summary_without_portfolio_data_has_no_analytical(
+        self, simulation_results
+    ):
+        """Test that without portfolio_data, no analytical sections."""
+        summary = generate_confidence_summary(
+            simulation_results, "claim_volume_shocked"
+        )
+
+        assert "portfolio_moments" not in summary
+        assert "analytical_scenarios" not in summary
+
+    def test_analytical_scenarios_match_simulation_scenarios_count(
+        self, sample_data, simulation_results
+    ):
+        """Test analytical and empirical scenarios have same count."""
+        custom = [5_000, 50_000, 500_000]
+        summary = generate_confidence_summary(
+            simulation_results,
+            "claim_volume_shocked",
+            simulation_scenarios=custom,
+            portfolio_data={
+                "volumes": sample_data["volume"].values,
+                "qx": sample_data["shocked_qx"].values,
+            },
+        )
+
+        assert len(summary["analytical_scenarios"]) == len(summary["scenarios"])
+
+    def test_analytical_ci_decreases_with_n(
+        self, sample_data, simulation_results
+    ):
+        """Test analytical CI widths decrease with more simulations."""
+        summary = generate_confidence_summary(
+            simulation_results,
+            "claim_volume_shocked",
+            portfolio_data={
+                "volumes": sample_data["volume"].values,
+                "qx": sample_data["shocked_qx"].values,
+            },
+        )
+
+        widths = [s["ci_width_relative"] for s in summary["analytical_scenarios"]]
+        assert widths[0] > widths[1] > widths[2]
+
+    def test_analytical_and_empirical_same_order_of_magnitude(
+        self, sample_data, simulation_results
+    ):
+        """Test analytical and empirical CI widths are in same ballpark.
+
+        They won't match exactly (analytical uses CLT, empirical uses
+        order statistics), but they should be within a factor of ~3.
+        """
+        summary = generate_confidence_summary(
+            simulation_results,
+            "claim_volume_shocked",
+            portfolio_data={
+                "volumes": sample_data["volume"].values,
+                "qx": sample_data["shocked_qx"].values,
+            },
+        )
+
+        for emp, ana in zip(summary["scenarios"], summary["analytical_scenarios"]):
+            emp_w = emp["projected_ci_width_relative"]
+            ana_w = ana["ci_width_relative"]
+
+            if emp_w > 0 and ana_w > 0:
+                ratio = max(emp_w, ana_w) / min(emp_w, ana_w)
+                assert ratio < 3.0, (
+                    f"Analytical ({ana_w:.2f}%) and empirical ({emp_w:.2f}%) "
+                    f"differ by factor {ratio:.1f} at n={emp['n_simulations']}"
+                )
+
+    def test_print_with_analytical_shows_portfolio_section(
+        self, sample_data, simulation_results, capsys
+    ):
+        """Test that print output includes analytical sections."""
+        summary = generate_confidence_summary(
+            simulation_results,
+            "claim_volume_shocked",
+            portfolio_data={
+                "volumes": sample_data["volume"].values,
+                "qx": sample_data["shocked_qx"].values,
+            },
+        )
+        print_confidence_summary(summary)
+
+        captured = capsys.readouterr()
+        assert "PORTFOLIO STRUCTURE" in captured.out
+        assert "Skewness" in captured.out
+        assert "Analytical" in captured.out
+        assert "Cornish-Fisher" in captured.out
