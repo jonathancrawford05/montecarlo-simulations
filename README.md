@@ -102,6 +102,34 @@ results = stochastic_runs_hybrid(
 )
 ```
 
+### Multi-Year Projection
+
+Provide per-year qx columns and (optionally) per-year volumes. The simulator
+returns total losses plus per-year breakdowns via `*_by_year` keys.
+
+```python
+from mortality_simulations import stochastic_runs_multi_year
+
+data = pd.DataFrame({
+    "volume": [...],
+    "baseline_qx_1": [...],
+    "baseline_qx_2": [...],
+    "baseline_qx_3": [...],
+    "shocked_qx_1": [...],
+    "shocked_qx_2": [...],
+    "shocked_qx_3": [...],
+})
+
+results = stochastic_runs_multi_year(
+    data=data,
+    n_trials=1000,
+    volume_col="volume",
+    baseline_qx_cols=["baseline_qx_1", "baseline_qx_2", "baseline_qx_3"],
+    shocked_qx_cols=["shocked_qx_1", "shocked_qx_2", "shocked_qx_3"],
+    n_processes="auto",
+)
+```
+
 ### Inspecting Optimal Parameters
 
 ```python

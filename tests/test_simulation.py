@@ -17,6 +17,7 @@ from mortality_simulations import (
     plan_simulation_count,
     print_confidence_summary,
     stochastic_runs_hybrid,
+    stochastic_runs_multi_year,
 )
 
 
@@ -30,6 +31,24 @@ def sample_data():
             "volume": np.random.uniform(100_000, 50_000_000, n_rows),
             "baseline_qx": np.random.uniform(0.001, 0.05, n_rows),
             "shocked_qx": np.random.uniform(0.002, 0.08, n_rows),
+        }
+    )
+
+
+@pytest.fixture
+def sample_multi_year_data():
+    """Create sample multi-year data for testing."""
+    np.random.seed(123)
+    n_rows = 500
+    return pd.DataFrame(
+        {
+            "volume": np.random.uniform(100_000, 50_000_000, n_rows),
+            "baseline_qx_1": np.random.uniform(0.001, 0.05, n_rows),
+            "baseline_qx_2": np.random.uniform(0.001, 0.05, n_rows),
+            "baseline_qx_3": np.random.uniform(0.001, 0.05, n_rows),
+            "shocked_qx_1": np.random.uniform(0.002, 0.08, n_rows),
+            "shocked_qx_2": np.random.uniform(0.002, 0.08, n_rows),
+            "shocked_qx_3": np.random.uniform(0.002, 0.08, n_rows),
         }
     )
 
@@ -206,6 +225,76 @@ class TestGetOptimalParams:
         # At boundary
         n_processes, batch_size = get_optimal_params(5_000_000)
         assert batch_size == 10
+
+
+class TestStochasticRunsMultiYear:
+    """Tests for the stochastic_runs_multi_year function."""
+
+    def test_returns_expected_keys(self, sample_multi_year_data):
+        """Test that results contain all expected keys."""
+        results = stochastic_runs_multi_year(
+            data=sample_multi_year_data,
+            n_trials=10,
+            volume_col="volume",
+            baseline_qx_cols=["baseline_qx_1", "baseline_qx_2", "baseline_qx_3"],
+            shocked_qx_cols=["shocked_qx_1", "shocked_qx_2", "shocked_qx_3"],
+            n_processes=1,
+            batch_size=5,
+        )
+
+        expected_keys = {
+            "claim_volume_baseline",
+            "claim_volume_shocked",
+            "claim_count_baseline",
+            "claim_count_shocked",
+            "claim_count_baseline_10PLUS",
+            "claim_count_shocked_10PLUS",
+            "volume_baseline_10PLUS",
+            "volume_shocked_10PLUS",
+            "claim_volume_baseline_by_year",
+            "claim_volume_shocked_by_year",
+            "claim_count_baseline_by_year",
+            "claim_count_shocked_by_year",
+            "claim_count_baseline_10PLUS_by_year",
+            "claim_count_shocked_10PLUS_by_year",
+            "volume_baseline_10PLUS_by_year",
+            "volume_shocked_10PLUS_by_year",
+        }
+        assert set(results.keys()) == expected_keys
+
+    def test_yearly_sums_match_totals(self, sample_multi_year_data):
+        """Test that totals equal sum of yearly results."""
+        results = stochastic_runs_multi_year(
+            data=sample_multi_year_data,
+            n_trials=25,
+            volume_col="volume",
+            baseline_qx_cols=["baseline_qx_1", "baseline_qx_2", "baseline_qx_3"],
+            shocked_qx_cols=["shocked_qx_1", "shocked_qx_2", "shocked_qx_3"],
+            n_processes=1,
+        )
+
+        baseline_total = np.array(results["claim_volume_baseline"])
+        baseline_yearly = np.array(results["claim_volume_baseline_by_year"]).sum(axis=0)
+        shocked_total = np.array(results["claim_volume_shocked"])
+        shocked_yearly = np.array(results["claim_volume_shocked_by_year"]).sum(axis=0)
+
+        np.testing.assert_allclose(baseline_total, baseline_yearly)
+        np.testing.assert_allclose(shocked_total, shocked_yearly)
+
+    def test_return_yearly_false(self, sample_multi_year_data):
+        """Test that yearly keys are omitted when return_yearly is False."""
+        results = stochastic_runs_multi_year(
+            data=sample_multi_year_data,
+            n_trials=10,
+            volume_col="volume",
+            baseline_qx_cols=["baseline_qx_1", "baseline_qx_2", "baseline_qx_3"],
+            shocked_qx_cols=["shocked_qx_1", "shocked_qx_2", "shocked_qx_3"],
+            n_processes=1,
+            return_yearly=False,
+        )
+
+        assert "claim_volume_baseline_by_year" not in results
+        assert "claim_volume_shocked_by_year" not in results
 
 
 class TestCheckThreadingConfig:
