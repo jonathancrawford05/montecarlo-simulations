@@ -164,6 +164,124 @@ def _worker_vectorized_batch(args):
     return results
 
 
+def _worker_vectorized_batch_multi_year(args):
+    """Worker function for multi-year simulation with vectorized batches."""
+    (
+        volumes_by_year,
+        baseline_qx_by_year,
+        shocked_qx_by_year,
+        large_mask_by_year,
+        n_trials,
+        batch_size,
+        return_yearly,
+    ) = args
+    n_rows, n_years = volumes_by_year.shape
+
+    results = {
+        "claim_volume_baseline": np.zeros(n_trials),
+        "claim_volume_shocked": np.zeros(n_trials),
+        "claim_count_baseline": np.zeros(n_trials, dtype=int),
+        "claim_count_shocked": np.zeros(n_trials, dtype=int),
+        "claim_count_baseline_10PLUS": np.zeros(n_trials, dtype=int),
+        "claim_count_shocked_10PLUS": np.zeros(n_trials, dtype=int),
+        "volume_baseline_10PLUS": np.zeros(n_trials),
+        "volume_shocked_10PLUS": np.zeros(n_trials),
+    }
+
+    if return_yearly:
+        results["claim_volume_baseline_by_year"] = np.zeros((n_years, n_trials))
+        results["claim_volume_shocked_by_year"] = np.zeros((n_years, n_trials))
+        results["claim_count_baseline_by_year"] = np.zeros((n_years, n_trials), dtype=int)
+        results["claim_count_shocked_by_year"] = np.zeros((n_years, n_trials), dtype=int)
+        results["claim_count_baseline_10PLUS_by_year"] = np.zeros(
+            (n_years, n_trials), dtype=int
+        )
+        results["claim_count_shocked_10PLUS_by_year"] = np.zeros(
+            (n_years, n_trials), dtype=int
+        )
+        results["volume_baseline_10PLUS_by_year"] = np.zeros((n_years, n_trials))
+        results["volume_shocked_10PLUS_by_year"] = np.zeros((n_years, n_trials))
+
+    for batch_start in range(0, n_trials, batch_size):
+        batch_end = min(batch_start + batch_size, n_trials)
+        batch_n = batch_end - batch_start
+
+        alive_baseline = np.ones((n_rows, batch_n), dtype=bool)
+        alive_shocked = np.ones((n_rows, batch_n), dtype=bool)
+
+        for year_idx in range(n_years):
+            rand_numbers = np.random.rand(n_rows, batch_n)
+
+            baseline_qx = baseline_qx_by_year[:, year_idx]
+            shocked_qx = shocked_qx_by_year[:, year_idx]
+            volumes = volumes_by_year[:, year_idx]
+            large_mask = large_mask_by_year[:, year_idx]
+
+            dead_baseline = (rand_numbers < baseline_qx[:, np.newaxis]) & alive_baseline
+            dead_shocked = (rand_numbers < shocked_qx[:, np.newaxis]) & alive_shocked
+
+            baseline_count = dead_baseline.sum(axis=0)
+            shocked_count = dead_shocked.sum(axis=0)
+            baseline_volume = (dead_baseline * volumes[:, np.newaxis]).sum(axis=0)
+            shocked_volume = (dead_shocked * volumes[:, np.newaxis]).sum(axis=0)
+
+            large_baseline = dead_baseline & large_mask[:, np.newaxis]
+            large_shocked = dead_shocked & large_mask[:, np.newaxis]
+
+            baseline_count_large = large_baseline.sum(axis=0)
+            shocked_count_large = large_shocked.sum(axis=0)
+            baseline_volume_large = (large_baseline * volumes[:, np.newaxis]).sum(axis=0)
+            shocked_volume_large = (large_shocked * volumes[:, np.newaxis]).sum(axis=0)
+
+            results["claim_count_baseline"][batch_start:batch_end] += baseline_count
+            results["claim_count_shocked"][batch_start:batch_end] += shocked_count
+            results["claim_volume_baseline"][batch_start:batch_end] += baseline_volume
+            results["claim_volume_shocked"][batch_start:batch_end] += shocked_volume
+            results["claim_count_baseline_10PLUS"][
+                batch_start:batch_end
+            ] += baseline_count_large
+            results["claim_count_shocked_10PLUS"][
+                batch_start:batch_end
+            ] += shocked_count_large
+            results["volume_baseline_10PLUS"][
+                batch_start:batch_end
+            ] += baseline_volume_large
+            results["volume_shocked_10PLUS"][
+                batch_start:batch_end
+            ] += shocked_volume_large
+
+            if return_yearly:
+                results["claim_count_baseline_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = baseline_count
+                results["claim_count_shocked_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = shocked_count
+                results["claim_volume_baseline_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = baseline_volume
+                results["claim_volume_shocked_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = shocked_volume
+                results["claim_count_baseline_10PLUS_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = baseline_count_large
+                results["claim_count_shocked_10PLUS_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = shocked_count_large
+                results["volume_baseline_10PLUS_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = baseline_volume_large
+                results["volume_shocked_10PLUS_by_year"][
+                    year_idx, batch_start:batch_end
+                ] = shocked_volume_large
+
+            alive_baseline &= ~dead_baseline
+            alive_shocked &= ~dead_shocked
+
+    return results
+
+
 def stochastic_runs_hybrid(
     data,
     n_trials,
@@ -254,6 +372,111 @@ def stochastic_runs_hybrid(
     final_results = {}
     for key in worker_results[0].keys():
         final_results[key] = np.concatenate([w[key] for w in worker_results])
+
+    return {k: v.tolist() for k, v in final_results.items()}
+
+
+def stochastic_runs_multi_year(
+    data,
+    n_trials,
+    volume_col,
+    baseline_qx_cols,
+    shocked_qx_cols,
+    volume_cols=None,
+    n_processes="auto",
+    batch_size="auto",
+    return_yearly=True,
+):
+    """
+    Multi-year hybrid Monte Carlo simulation with vectorized batches.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Input data containing policy information.
+    n_trials : int
+        Number of Monte Carlo trials to run.
+    volume_col : str
+        Column name for level claim volumes (used if volume_cols is None).
+    baseline_qx_cols : list[str]
+        Column names for baseline mortality rates per year.
+    shocked_qx_cols : list[str]
+        Column names for shocked mortality rates per year.
+    volume_cols : list[str] or None, default=None
+        Column names for per-year claim volumes. If None, volume_col is used
+        for all years.
+    n_processes : int or "auto", default="auto"
+        Number of parallel processes. "auto" selects optimal based on data size.
+    batch_size : int or "auto", default="auto"
+        Number of trials per batch within each worker. "auto" selects optimal
+        based on data size to balance speed and memory usage.
+    return_yearly : bool, default=True
+        Whether to return per-year results in addition to totals.
+
+    Returns
+    -------
+    dict
+        Dictionary containing total simulation results and optional per-year
+        breakdowns with *_by_year keys.
+    """
+    if not baseline_qx_cols or not shocked_qx_cols:
+        raise ValueError("baseline_qx_cols and shocked_qx_cols must be provided.")
+    if len(baseline_qx_cols) != len(shocked_qx_cols):
+        raise ValueError("baseline_qx_cols and shocked_qx_cols must be the same length.")
+    if volume_cols is not None and len(volume_cols) != len(baseline_qx_cols):
+        raise ValueError("volume_cols must match the length of baseline_qx_cols.")
+
+    n_rows = len(data)
+    n_years = len(baseline_qx_cols)
+
+    if n_processes == "auto" or batch_size == "auto":
+        optimal_processes, optimal_batch = get_optimal_params(n_rows)
+        if n_processes == "auto":
+            n_processes = optimal_processes
+        if batch_size == "auto":
+            batch_size = optimal_batch
+
+    baseline_qx_by_year = data[baseline_qx_cols].values
+    shocked_qx_by_year = data[shocked_qx_cols].values
+
+    if volume_cols is None:
+        volumes = data[volume_col].values
+        volumes_by_year = np.repeat(volumes[:, np.newaxis], n_years, axis=1)
+    else:
+        volumes_by_year = data[volume_cols].values
+
+    large_mask_by_year = volumes_by_year >= 10_000_000
+
+    trials_per_process = n_trials // n_processes
+    remainder = n_trials % n_processes
+
+    worker_args = []
+    for i in range(n_processes):
+        worker_trials = trials_per_process + (1 if i < remainder else 0)
+        worker_args.append(
+            (
+                volumes_by_year,
+                baseline_qx_by_year,
+                shocked_qx_by_year,
+                large_mask_by_year,
+                worker_trials,
+                batch_size,
+                return_yearly,
+            )
+        )
+
+    if n_processes == 1:
+        worker_results = [_worker_vectorized_batch_multi_year(worker_args[0])]
+    else:
+        with Pool(n_processes, initializer=_init_worker) as pool:
+            worker_results = pool.map(_worker_vectorized_batch_multi_year, worker_args)
+
+    final_results = {}
+    for key in worker_results[0].keys():
+        if key.endswith("_by_year"):
+            final_results[key] = np.concatenate([w[key] for w in worker_results], axis=1)
+        else:
+            final_results[key] = np.concatenate([w[key] for w in worker_results])
 
     return {k: v.tolist() for k, v in final_results.items()}
 

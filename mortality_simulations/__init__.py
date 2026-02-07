@@ -11,6 +11,7 @@ from mortality_simulations.simulation import (
     plan_simulation_count,
     print_confidence_summary,
     stochastic_runs_hybrid,
+    stochastic_runs_multi_year,
 )
 from mortality_simulations.joint_life import (
     stochastic_runs_joint_life,
@@ -27,6 +28,7 @@ __version__ = "0.1.0"
 __all__ = [
     # Simulation
     "stochastic_runs_hybrid",
+    "stochastic_runs_multi_year",
     "get_optimal_params",
     "check_threading_config",
     # Joint life simulation
