@@ -2,23 +2,21 @@
 Spark-distributed Monte Carlo mortality simulation.
 
 This module provides a Spark-native implementation of the mortality simulation
-using pandas_udf for distributed execution across a Spark cluster. Use this
+using mapInPandas for distributed execution across a Spark cluster. Use this
 when the driver-only multiprocessing approach is insufficient.
 
-Requires PySpark to be installed and a SparkSession to be available.
+Requires PySpark 3.0+ and a SparkSession to be available.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
 from mortality_simulations._core import (
     RESULT_KEYS,
-    concatenate_results,
-    results_to_lists,
     simulate_trials,
 )
 
@@ -102,8 +100,6 @@ def stochastic_runs_spark(
     The portfolio data is broadcast to all executors, so ensure the driver
     has enough memory to serialize it (typically not an issue for <100M rows).
     """
-    from pyspark.sql import functions as F
-    from pyspark.sql.pandas.functions import pandas_udf
     from pyspark.sql.types import (
         ArrayType,
         DoubleType,
@@ -137,7 +133,7 @@ def stochastic_runs_spark(
         partition_data, ["partition_id", "n_trials"]
     ).repartition(n_partitions, "partition_id")
 
-    # Define output schema for the pandas_udf
+    # Define output schema for mapInPandas
     result_schema = StructType([
         StructField("claim_volume_baseline", ArrayType(DoubleType()), False),
         StructField("claim_volume_shocked", ArrayType(DoubleType()), False),
@@ -149,18 +145,18 @@ def stochastic_runs_spark(
         StructField("volume_shocked_10PLUS", ArrayType(DoubleType()), False),
     ])
 
-    # Capture batch_size in closure
+    # Capture variables in closure for the map function
     _batch_size = batch_size
+    _volumes_bc = volumes_bc
+    _baseline_qx_bc = baseline_qx_bc
+    _shocked_qx_bc = shocked_qx_bc
 
-    @pandas_udf(result_schema)
-    def simulate_partition(
-        iterator: Iterator[pd.DataFrame],
-    ) -> Iterator[pd.DataFrame]:
-        """Run simulation for each partition's trials."""
+    def process_partition(iterator):
+        """Process each partition's trials using mapInPandas."""
         # Get broadcast data (once per executor)
-        vols = volumes_bc.value
-        base_qx = baseline_qx_bc.value
-        shock_qx = shocked_qx_bc.value
+        vols = _volumes_bc.value
+        base_qx = _baseline_qx_bc.value
+        shock_qx = _shocked_qx_bc.value
 
         for batch_df in iterator:
             results_list = []
@@ -195,10 +191,8 @@ def stochastic_runs_spark(
 
             yield pd.DataFrame(results_list)
 
-    # Execute distributed simulation
-    results_df = partitions_df.select(
-        simulate_partition(F.struct("partition_id", "n_trials")).alias("results")
-    ).select("results.*")
+    # Execute distributed simulation using mapInPandas (Spark 3.0+)
+    results_df = partitions_df.mapInPandas(process_partition, schema=result_schema)
 
     # Collect and concatenate results
     collected = results_df.collect()
