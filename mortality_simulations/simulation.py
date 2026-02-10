@@ -15,6 +15,8 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 from scipy import stats
 
+from mortality_simulations._core import simulate_trials, results_to_lists
+
 
 def _init_worker():
     """
@@ -109,59 +111,15 @@ def get_optimal_params(n_rows: int) -> tuple[int, int]:
 
 def _worker_vectorized_batch(args):
     """Worker function - each process runs vectorized batches."""
-    volumes, baseline_qx, shocked_qx, large_mask, n_trials, batch_size = args
-    n_rows = len(volumes)
-
-    # Pre-allocate for this worker's trials
-    results = {
-        "claim_volume_baseline": np.zeros(n_trials),
-        "claim_volume_shocked": np.zeros(n_trials),
-        "claim_count_baseline": np.zeros(n_trials, dtype=int),
-        "claim_count_shocked": np.zeros(n_trials, dtype=int),
-        "claim_count_baseline_10PLUS": np.zeros(n_trials, dtype=int),
-        "claim_count_shocked_10PLUS": np.zeros(n_trials, dtype=int),
-        "volume_baseline_10PLUS": np.zeros(n_trials),
-        "volume_shocked_10PLUS": np.zeros(n_trials),
-    }
-
-    # Process in batches
-    for batch_start in range(0, n_trials, batch_size):
-        batch_end = min(batch_start + batch_size, n_trials)
-        batch_n = batch_end - batch_start
-
-        rand_numbers = np.random.rand(n_rows, batch_n)
-
-        dead_baseline = rand_numbers < baseline_qx[:, np.newaxis]
-        dead_shocked = rand_numbers < shocked_qx[:, np.newaxis]
-
-        results["claim_count_baseline"][batch_start:batch_end] = dead_baseline.sum(
-            axis=0
-        )
-        results["claim_count_shocked"][batch_start:batch_end] = dead_shocked.sum(axis=0)
-        results["claim_volume_baseline"][batch_start:batch_end] = (
-            dead_baseline * volumes[:, np.newaxis]
-        ).sum(axis=0)
-        results["claim_volume_shocked"][batch_start:batch_end] = (
-            dead_shocked * volumes[:, np.newaxis]
-        ).sum(axis=0)
-
-        large_baseline = dead_baseline & large_mask[:, np.newaxis]
-        large_shocked = dead_shocked & large_mask[:, np.newaxis]
-
-        results["claim_count_baseline_10PLUS"][batch_start:batch_end] = (
-            large_baseline.sum(axis=0)
-        )
-        results["claim_count_shocked_10PLUS"][batch_start:batch_end] = (
-            large_shocked.sum(axis=0)
-        )
-        results["volume_baseline_10PLUS"][batch_start:batch_end] = (
-            large_baseline * volumes[:, np.newaxis]
-        ).sum(axis=0)
-        results["volume_shocked_10PLUS"][batch_start:batch_end] = (
-            large_shocked * volumes[:, np.newaxis]
-        ).sum(axis=0)
-
-    return results
+    volumes, baseline_qx, shocked_qx, n_trials, batch_size = args
+    return simulate_trials(
+        volumes=volumes,
+        baseline_qx=baseline_qx,
+        shocked_qx=shocked_qx,
+        n_trials=n_trials,
+        batch_size=batch_size,
+        random_state=None,  # Use global random state (legacy behavior)
+    )
 
 
 def stochastic_runs_hybrid(
@@ -224,19 +182,18 @@ def stochastic_runs_hybrid(
     volumes = data[volume_col].values
     baseline_qx = data[baseline_qx_col].values
     shocked_qx = data[shocked_qx_col].values
-    large_mask = volumes >= 10_000_000
 
     # Split trials across processes
     trials_per_process = n_trials // n_processes
     remainder = n_trials % n_processes
 
-    # Create worker arguments
+    # Create worker arguments (without large_mask - handled in _core)
     worker_args = []
     for i in range(n_processes):
         # Give remainder trials to first few workers
         worker_trials = trials_per_process + (1 if i < remainder else 0)
         worker_args.append(
-            (volumes, baseline_qx, shocked_qx, large_mask, worker_trials, batch_size)
+            (volumes, baseline_qx, shocked_qx, worker_trials, batch_size)
         )
 
     # Execute simulation
@@ -255,7 +212,7 @@ def stochastic_runs_hybrid(
     for key in worker_results[0].keys():
         final_results[key] = np.concatenate([w[key] for w in worker_results])
 
-    return {k: v.tolist() for k, v in final_results.items()}
+    return results_to_lists(final_results)
 
 
 def analyze_simulation_confidence(

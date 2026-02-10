@@ -1,12 +1,16 @@
 # Mortality Monte Carlo Simulations
 
-A high-performance Python package for running Monte Carlo mortality simulations using hybrid parallel processing with vectorized batch operations.
+A high-performance Python package for running Monte Carlo mortality simulations with two execution backends:
+
+- **Local (multiprocessing)** — For single-machine execution
+- **Distributed (Spark)** — For cluster execution on Databricks/Spark
 
 ## Overview
 
 This project implements stochastic mortality simulations designed to efficiently process large datasets (millions of rows) by combining:
 
-- **Multiprocessing**: Distributes trials across CPU cores
+- **Multiprocessing**: Distributes trials across CPU cores (local backend)
+- **Spark pandas_udf**: Distributes trials across cluster workers (Spark backend)
 - **Vectorized batching**: NumPy-based batch operations within each worker
 - **Auto-tuning**: Automatically selects optimal parameters based on data size
 
@@ -16,7 +20,9 @@ This project implements stochastic mortality simulations designed to efficiently
 mortality_simulations/
 ├── mortality_simulations/     # Main package
 │   ├── __init__.py
-│   └── simulation.py          # Core simulation + confidence analysis
+│   ├── _core.py               # Shared simulation logic
+│   ├── simulation.py          # Local backend (multiprocessing)
+│   └── spark_simulation.py    # Spark backend (pandas_udf)
 ├── tests/                     # Unit tests
 ├── benchmarks/                # Performance benchmarks and calibration
 ├── examples/                  # Jupyter notebooks
@@ -126,6 +132,86 @@ The package includes calibrated defaults based on benchmarks run on a 10-core Ma
 - **More cores ≠ faster**: Beyond 2 processes, coordination overhead and memory bandwidth become bottlenecks
 
 For detailed benchmark results and guidance on calibrating for your system, see [docs/calibration.md](docs/calibration.md).
+
+## Spark / Databricks Execution
+
+For large-scale simulations on Databricks or Spark clusters, use the `spark_simulation` module. This distributes trials across cluster workers using `pandas_udf`.
+
+### Why Spark?
+
+The local `stochastic_runs_hybrid` uses Python's `multiprocessing.Pool`, which:
+- Runs only on the **driver node** (not distributed across workers)
+- Can cause `Py4JException` errors on Databricks due to JVM conflicts
+
+The Spark backend (`stochastic_runs_spark`) solves both issues by using Spark's native distributed execution.
+
+### Basic Usage
+
+```python
+from pyspark.sql import SparkSession
+from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+spark = SparkSession.builder.getOrCreate()
+
+results = stochastic_runs_spark(
+    spark,
+    data,                           # pandas DataFrame
+    n_trials=1_000_000,
+    volume_col="volume",
+    baseline_qx_col="baseline_qx",
+    shocked_qx_col="shocked_qx",
+    n_partitions=200,               # Adjust based on cluster size
+    batch_size=50,
+)
+
+# Results are compatible with confidence analysis
+from mortality_simulations import analyze_simulation_confidence
+ci = analyze_simulation_confidence(results, "claim_volume_shocked")
+```
+
+### Calibration Helpers
+
+The module includes utilities to help size your Spark job:
+
+```python
+from mortality_simulations.spark_simulation import (
+    estimate_spark_memory,
+    recommend_spark_config,
+)
+
+# Estimate memory for 10M rows with batch_size=50
+mem = estimate_spark_memory(
+    n_rows=10_000_000,
+    batch_size=50,
+    n_partitions=200,
+    executor_memory_gb=16.0,
+)
+print(f"Memory per batch: {mem['memory_per_batch_gb']:.1f} GB")
+print(f"Fits in executor: {mem['fits_in_executor']}")
+
+# Get recommended config for your cluster
+config = recommend_spark_config(
+    n_rows=10_000_000,
+    n_trials=1_000_000,
+    executor_cores=4,
+    executor_memory_gb=16.0,
+    num_executors=10,
+)
+print(f"Recommended partitions: {config['n_partitions']}")
+print(f"Recommended batch_size: {config['batch_size']}")
+```
+
+### Memory Model
+
+Memory usage per executor batch: `n_rows × batch_size × 20 bytes`
+
+| Portfolio Size | batch_size | Memory per Batch |
+|----------------|------------|------------------|
+| 1M rows | 50 | ~1 GB |
+| 10M rows | 50 | ~10 GB |
+| 10M rows | 25 | ~5 GB |
+
+The portfolio data is broadcast to all executors (3 arrays × n_rows × 8 bytes).
 
 ## Confidence Analysis
 

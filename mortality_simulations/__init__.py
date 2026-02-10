@@ -1,4 +1,21 @@
-"""Mortality Monte Carlo Simulations package."""
+"""
+Mortality Monte Carlo Simulations package.
+
+This package provides mortality simulation tools with two execution backends:
+
+1. **Local (multiprocessing)** — Default, runs on a single machine.
+   Import directly from this package::
+
+       from mortality_simulations import stochastic_runs_hybrid
+
+2. **Distributed (Spark)** — For cluster execution on Databricks/Spark.
+   Import from the spark_simulation module::
+
+       from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+The Spark backend requires PySpark and is not imported by default to avoid
+adding PySpark as a required dependency.
+"""
 
 from mortality_simulations.simulation import (
     analyze_simulation_confidence,
@@ -15,7 +32,7 @@ from mortality_simulations.simulation import (
 
 __version__ = "0.1.0"
 __all__ = [
-    # Simulation
+    # Simulation — local (multiprocessing)
     "stochastic_runs_hybrid",
     "get_optimal_params",
     "check_threading_config",
@@ -29,3 +46,12 @@ __all__ = [
     "generate_confidence_summary",
     "print_confidence_summary",
 ]
+
+
+def _spark_available() -> bool:
+    """Check if PySpark is available for import."""
+    try:
+        import pyspark  # noqa: F401
+        return True
+    except ImportError:
+        return False
