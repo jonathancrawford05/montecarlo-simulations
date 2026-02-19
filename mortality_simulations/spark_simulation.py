@@ -33,9 +33,12 @@ def stochastic_runs_spark(
     shocked_qx_col: str,
     n_partitions: int = 100,
     batch_size: int = 50,
+    random_mode: str = "standard",
+    life_id_col: str | None = None,
+    seed: int = 0,
 ) -> dict[str, list]:
     """
-    Distributed Monte Carlo simulation using Spark pandas_udf.
+    Distributed Monte Carlo simulation using Spark mapInPandas.
 
     Distributes simulation trials across Spark workers, with each worker
     running vectorized Bernoulli simulations on the full portfolio. This
@@ -62,6 +65,17 @@ def stochastic_runs_spark(
     batch_size : int, default=50
         Number of trials per vectorized batch within each partition.
         Larger batches are faster but use more memory per executor.
+    random_mode : {"standard", "deterministic"}, default="standard"
+        - "standard": sequential numpy RNG seeded per partition.
+        - "deterministic": hash-based RNG keyed on (life_id, trial_id).
+          Guarantees identical results for any life regardless of portfolio
+          subset, batch size, or partition count. Requires ``life_id_col``.
+    life_id_col : str or None, default=None
+        Column containing a unique integer identifier for each life.
+        Required when random_mode="deterministic".
+    seed : int, default=0
+        Hash salt for deterministic mode. Use the same value across all
+        runs you want to compare. Ignored in standard mode.
 
     Returns
     -------
@@ -78,28 +92,40 @@ def stochastic_runs_spark(
 
     Examples
     --------
-    >>> from pyspark.sql import SparkSession
-    >>> from mortality_simulations.spark_simulation import stochastic_runs_spark
-    >>>
-    >>> spark = SparkSession.builder.getOrCreate()
+    Standard mode (existing behaviour):
+
     >>> results = stochastic_runs_spark(
-    ...     spark,
-    ...     data,
-    ...     n_trials=1_000_000,
+    ...     spark, data, n_trials=1_000_000,
     ...     volume_col="volume",
     ...     baseline_qx_col="baseline_qx",
     ...     shocked_qx_col="shocked_qx",
-    ...     n_partitions=200,  # Adjust based on cluster size
+    ...     n_partitions=120, batch_size=25,
+    ... )
+
+    Deterministic mode (subset-reproducible):
+
+    >>> results = stochastic_runs_spark(
+    ...     spark, data, n_trials=1_000_000,
+    ...     volume_col="volume",
+    ...     baseline_qx_col="baseline_qx",
+    ...     shocked_qx_col="shocked_qx",
+    ...     n_partitions=120, batch_size=25,
+    ...     life_id_col="policy_id",
+    ...     random_mode="deterministic",
+    ...     seed=42,
     ... )
 
     Notes
     -----
-    Memory usage per executor: approximately n_rows * batch_size * 20 bytes.
-    For a 10M row portfolio with batch_size=50, this is ~10 GB per executor.
+    Memory per executor batch: n_rows * batch_size * 20 bytes.
+    For a 10M row portfolio with batch_size=25, this is ~5 GB per executor.
 
-    The portfolio data is broadcast to all executors, so ensure the driver
-    has enough memory to serialize it (typically not an issue for <100M rows).
+    The portfolio data is broadcast to all executors
+    (3 arrays × n_rows × 8 bytes ≈ 240 MB for 10M rows).
     """
+    if random_mode == "deterministic" and life_id_col is None:
+        raise ValueError("life_id_col is required when random_mode='deterministic'")
+
     from pyspark.sql.types import (
         ArrayType,
         DoubleType,
@@ -112,25 +138,34 @@ def stochastic_runs_spark(
     volumes = data[volume_col].values.astype(np.float64)
     baseline_qx = data[baseline_qx_col].values.astype(np.float64)
     shocked_qx = data[shocked_qx_col].values.astype(np.float64)
+    life_ids = (
+        data[life_id_col].values.astype(np.uint64)
+        if life_id_col is not None
+        else None
+    )
 
     # Broadcast portfolio data to all workers
     volumes_bc = spark.sparkContext.broadcast(volumes)
     baseline_qx_bc = spark.sparkContext.broadcast(baseline_qx)
     shocked_qx_bc = spark.sparkContext.broadcast(shocked_qx)
+    life_ids_bc = spark.sparkContext.broadcast(life_ids) if life_ids is not None else None
 
-    # Distribute trials across partitions
+    # Distribute trials across partitions, tracking global trial start offset
+    # so deterministic mode can form globally unique trial IDs per partition.
     trials_per_partition = n_trials // n_partitions
     remainder = n_trials % n_partitions
 
-    # Create DataFrame with partition assignments
     partition_data = []
+    global_trial_start = 0
     for i in range(n_partitions):
         partition_trials = trials_per_partition + (1 if i < remainder else 0)
         if partition_trials > 0:
-            partition_data.append((i, partition_trials))
+            # (partition_id, n_trials_this_partition, global_trial_start_offset)
+            partition_data.append((i, partition_trials, global_trial_start))
+            global_trial_start += partition_trials
 
     partitions_df = spark.createDataFrame(
-        partition_data, ["partition_id", "n_trials"]
+        partition_data, ["partition_id", "n_trials", "trial_start"]
     ).repartition(n_partitions, "partition_id")
 
     # Define output schema for mapInPandas
@@ -145,18 +180,21 @@ def stochastic_runs_spark(
         StructField("volume_shocked_10PLUS", ArrayType(DoubleType()), False),
     ])
 
-    # Capture variables in closure for the map function
+    # Capture closure variables
     _batch_size = batch_size
+    _random_mode = random_mode
+    _seed = seed
     _volumes_bc = volumes_bc
     _baseline_qx_bc = baseline_qx_bc
     _shocked_qx_bc = shocked_qx_bc
+    _life_ids_bc = life_ids_bc
 
     def process_partition(iterator):
         """Process each partition's trials using mapInPandas."""
-        # Get broadcast data (once per executor)
         vols = _volumes_bc.value
         base_qx = _baseline_qx_bc.value
         shock_qx = _shocked_qx_bc.value
+        lids = _life_ids_bc.value if _life_ids_bc is not None else None
 
         for batch_df in iterator:
             results_list = []
@@ -164,10 +202,7 @@ def stochastic_runs_spark(
             for _, row in batch_df.iterrows():
                 partition_id = int(row["partition_id"])
                 partition_trials = int(row["n_trials"])
-
-                # Use partition_id as seed for reproducibility
-                # (different partitions get different random streams)
-                rng = np.random.default_rng(seed=partition_id)
+                trial_start = int(row["trial_start"])
 
                 result = simulate_trials(
                     volumes=vols,
@@ -175,7 +210,11 @@ def stochastic_runs_spark(
                     shocked_qx=shock_qx,
                     n_trials=partition_trials,
                     batch_size=_batch_size,
-                    random_state=rng,
+                    random_state=np.random.default_rng(seed=partition_id),
+                    random_mode=_random_mode,
+                    life_ids=lids,
+                    global_trial_start=trial_start,
+                    seed=_seed,
                 )
 
                 results_list.append({
@@ -194,12 +233,9 @@ def stochastic_runs_spark(
     # Execute distributed simulation using mapInPandas (Spark 3.0+)
     results_df = partitions_df.mapInPandas(process_partition, schema=result_schema)
 
-    # Collect and concatenate results
-    collected = results_df.collect()
-
-    # Flatten results from all partitions
+    # Collect and flatten results from all partitions
     final_results: dict[str, list] = {key: [] for key in RESULT_KEYS}
-    for row in collected:
+    for row in results_df.collect():
         for key in RESULT_KEYS:
             final_results[key].extend(row[key])
 
@@ -207,6 +243,8 @@ def stochastic_runs_spark(
     volumes_bc.unpersist()
     baseline_qx_bc.unpersist()
     shocked_qx_bc.unpersist()
+    if life_ids_bc is not None:
+        life_ids_bc.unpersist()
 
     return final_results
 

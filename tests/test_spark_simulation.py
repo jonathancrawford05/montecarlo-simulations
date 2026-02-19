@@ -322,3 +322,195 @@ class TestStochasticRunsSpark:
         assert "point_estimate" in ci
         assert "ci_lower" in ci
         assert "ci_upper" in ci
+
+
+class TestDeterministicModeGuards:
+    """Tests for deterministic mode validation that don't need Spark."""
+
+    def test_raises_when_deterministic_without_life_id_col(self):
+        """stochastic_runs_spark raises ValueError without life_id_col in deterministic mode."""
+        from unittest.mock import MagicMock
+
+        from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+        dummy_spark = MagicMock()
+        data = pd.DataFrame(
+            {
+                "volume": [1_000_000.0, 2_000_000.0],
+                "baseline_qx": [0.01, 0.02],
+                "shocked_qx": [0.02, 0.04],
+            }
+        )
+
+        with pytest.raises(ValueError, match="life_id_col"):
+            stochastic_runs_spark(
+                dummy_spark,
+                data,
+                n_trials=10,
+                volume_col="volume",
+                baseline_qx_col="baseline_qx",
+                shocked_qx_col="shocked_qx",
+                random_mode="deterministic",
+                life_id_col=None,
+            )
+
+
+@pytest.mark.skipif(not PYSPARK_AVAILABLE, reason="PySpark not installed")
+class TestStochasticRunsSparkDeterministic:
+    """Deterministic mode tests for stochastic_runs_spark (require PySpark)."""
+
+    @pytest.fixture(scope="class")
+    def spark(self):
+        """Create a local SparkSession for testing."""
+        spark = (
+            SparkSession.builder.master("local[2]")
+            .appName("mortality_sim_det_test")
+            .config("spark.ui.enabled", "false")
+            .getOrCreate()
+        )
+        yield spark
+        spark.stop()
+
+    @pytest.fixture
+    def sample_data_with_ids(self):
+        """Portfolio data that includes a unique life_id column."""
+        np.random.seed(99)
+        n = 200
+        return pd.DataFrame(
+            {
+                "life_id": np.arange(n, dtype=np.int64),
+                "volume": np.random.uniform(100_000, 10_000_000, n),
+                "baseline_qx": np.random.uniform(0.001, 0.04, n),
+                "shocked_qx": np.random.uniform(0.002, 0.06, n),
+            }
+        )
+
+    def test_deterministic_reproducible(self, spark, sample_data_with_ids):
+        """Two runs with the same seed produce identical results."""
+        from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+        kwargs = dict(
+            spark=spark,
+            data=sample_data_with_ids,
+            n_trials=200,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+            batch_size=25,
+            random_mode="deterministic",
+            life_id_col="life_id",
+            seed=42,
+        )
+
+        r1 = stochastic_runs_spark(**kwargs)
+        r2 = stochastic_runs_spark(**kwargs)
+
+        from mortality_simulations._core import RESULT_KEYS
+
+        for key in RESULT_KEYS:
+            np.testing.assert_array_equal(
+                sorted(r1[key]), sorted(r2[key]),
+                err_msg=f"Results differ for key={key}",
+            )
+
+    def test_deterministic_subset_reproducibility(self, spark, sample_data_with_ids):
+        """Lives in a portfolio subset produce the same random stream as the full portfolio."""
+        from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+        # Run on full portfolio
+        r_full = stochastic_runs_spark(
+            spark,
+            sample_data_with_ids,
+            n_trials=100,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+            batch_size=25,
+            random_mode="deterministic",
+            life_id_col="life_id",
+            seed=7,
+        )
+
+        # Run on a subset (first 100 lives)
+        subset = sample_data_with_ids.iloc[:100].copy()
+        r_sub = stochastic_runs_spark(
+            spark,
+            subset,
+            n_trials=100,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+            batch_size=25,
+            random_mode="deterministic",
+            life_id_col="life_id",
+            seed=7,
+        )
+
+        # Aggregate claim volumes should match across trial sets (same lives, same trials)
+        # We verify that the mean and std are very similar (exact match would
+        # require same trial ordering, which Spark doesn't guarantee across runs
+        # without sorting — instead we check sorted arrays match since aggregates
+        # are order-independent).
+        np.testing.assert_array_equal(
+            sorted(r_full["claim_volume_baseline"]),
+            sorted(r_sub["claim_volume_baseline"]),
+        )
+
+    def test_different_seeds_differ(self, spark, sample_data_with_ids):
+        """Different seeds produce different results."""
+        from mortality_simulations.spark_simulation import stochastic_runs_spark
+
+        r1 = stochastic_runs_spark(
+            spark,
+            sample_data_with_ids,
+            n_trials=200,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+            batch_size=25,
+            random_mode="deterministic",
+            life_id_col="life_id",
+            seed=0,
+        )
+        r2 = stochastic_runs_spark(
+            spark,
+            sample_data_with_ids,
+            n_trials=200,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+            batch_size=25,
+            random_mode="deterministic",
+            life_id_col="life_id",
+            seed=999,
+        )
+
+        # At least one metric should differ
+        differs = any(
+            sorted(r1[k]) != sorted(r2[k])
+            for k in ["claim_volume_baseline", "claim_count_shocked"]
+        )
+        assert differs, "Different seeds should produce different simulation results"
+
+    def test_standard_mode_still_works(self, spark, sample_data_with_ids):
+        """Standard mode (backwards-compatible default) still runs correctly."""
+        from mortality_simulations.spark_simulation import stochastic_runs_spark
+        from mortality_simulations._core import RESULT_KEYS
+
+        result = stochastic_runs_spark(
+            spark,
+            sample_data_with_ids,
+            n_trials=100,
+            volume_col="volume",
+            baseline_qx_col="baseline_qx",
+            shocked_qx_col="shocked_qx",
+            n_partitions=4,
+        )
+
+        assert set(result.keys()) == set(RESULT_KEYS)
+        assert all(len(result[k]) == 100 for k in RESULT_KEYS)

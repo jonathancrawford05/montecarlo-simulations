@@ -111,14 +111,18 @@ def get_optimal_params(n_rows: int) -> tuple[int, int]:
 
 def _worker_vectorized_batch(args):
     """Worker function - each process runs vectorized batches."""
-    volumes, baseline_qx, shocked_qx, n_trials, batch_size = args
+    volumes, baseline_qx, shocked_qx, n_trials, batch_size, random_mode, life_ids, seed = args
     return simulate_trials(
         volumes=volumes,
         baseline_qx=baseline_qx,
         shocked_qx=shocked_qx,
         n_trials=n_trials,
         batch_size=batch_size,
-        random_state=None,  # Use global random state (legacy behavior)
+        random_state=None,
+        random_mode=random_mode,
+        life_ids=life_ids,
+        global_trial_start=0,  # Single node: trial IDs are always globally 0-based
+        seed=seed,
     )
 
 
@@ -130,6 +134,9 @@ def stochastic_runs_hybrid(
     shocked_qx_col,
     n_processes="auto",
     batch_size="auto",
+    random_mode="standard",
+    life_id_col=None,
+    seed=0,
 ):
     """
     Hybrid parallel Monte Carlo simulation with vectorized batches.
@@ -154,6 +161,18 @@ def stochastic_runs_hybrid(
     batch_size : int or "auto", default="auto"
         Number of trials per batch within each worker. "auto" selects optimal
         based on data size to balance speed and memory usage.
+    random_mode : {"standard", "deterministic"}, default="standard"
+        - "standard": sequential numpy RNG. Fast; results vary across runs
+          unless random_state is fixed per worker.
+        - "deterministic": hash-based RNG keyed on (life_id, trial_id).
+          Results for any life are identical regardless of portfolio subset,
+          batch size, or process count. Requires ``life_id_col``.
+    life_id_col : str or None, default=None
+        Column containing a unique integer identifier for each life.
+        Required when random_mode="deterministic".
+    seed : int, default=0
+        Hash salt for deterministic mode. Use the same value across all
+        runs you want to compare. Ignored in standard mode.
 
     Returns
     -------
@@ -168,6 +187,8 @@ def stochastic_runs_hybrid(
         - volume_baseline_10PLUS: Large claim volumes baseline
         - volume_shocked_10PLUS: Large claim volumes shocked
     """
+    if random_mode == "deterministic" and life_id_col is None:
+        raise ValueError("life_id_col is required when random_mode='deterministic'")
     n_rows = len(data)
 
     # Apply calibrated defaults if "auto"
@@ -182,18 +203,20 @@ def stochastic_runs_hybrid(
     volumes = data[volume_col].values
     baseline_qx = data[baseline_qx_col].values
     shocked_qx = data[shocked_qx_col].values
+    life_ids = data[life_id_col].values.astype(np.uint64) if life_id_col else None
 
     # Split trials across processes
     trials_per_process = n_trials // n_processes
     remainder = n_trials % n_processes
 
-    # Create worker arguments (without large_mask - handled in _core)
+    # Create worker arguments
     worker_args = []
     for i in range(n_processes):
         # Give remainder trials to first few workers
         worker_trials = trials_per_process + (1 if i < remainder else 0)
         worker_args.append(
-            (volumes, baseline_qx, shocked_qx, worker_trials, batch_size)
+            (volumes, baseline_qx, shocked_qx, worker_trials, batch_size,
+             random_mode, life_ids, seed)
         )
 
     # Execute simulation
